@@ -27,6 +27,24 @@ Pehle run me jo source "ERR" dikhaye wo mujhe batao.
 import os, sys, time, json, sqlite3, threading, collections, random
 import requests
 
+TG_TOKEN, TG_CHAT = os.getenv("TG_TOKEN"), os.getenv("TG_CHAT")
+_tg_last = {"t": 0.0}
+
+
+def tg_send(msg):
+    if not (TG_TOKEN and TG_CHAT):
+        return
+    now = time.time()
+    if now - _tg_last["t"] < 3:   # flood se bachne ko
+        return
+    _tg_last["t"] = now
+    try:
+        requests.post("https://api.telegram.org/bot%s/sendMessage" % TG_TOKEN,
+                      json={"chat_id": TG_CHAT, "text": msg}, timeout=5)
+    except Exception as e:
+        print("TG send err", e)
+
+
 DB = os.getenv("DB", "market.db")
 EVERY = 60
 BIG_USD = 300_000
@@ -158,7 +176,10 @@ def put(con, ts, src, k, v):
 def put_event(con, ts, venue, kind, side, a, b, note):
     with LOCK:
         con.execute("INSERT INTO e VALUES(?,?,?,?,?,?,?)", (int(ts), venue, kind, side, a, b, note))
-    print("EVENT %s %s %s %s" % (venue, kind, side, note), flush=True)
+    line = "EVENT %s %s %s %s" % (venue, kind, side, note)
+    print(line, flush=True)
+    if kind in ("BURST", "ABSORB"):
+        tg_send("[%s] %s" % (time.strftime("%H:%M"), line))
 
 
 # ------------- FOOTPRINT 1: trade tape (slicing + absorption) -------------
