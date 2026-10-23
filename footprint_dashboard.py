@@ -249,13 +249,21 @@ def plain_setup(con, now):
         why.append("%d whale(s) long badha rahe hain (~$%.1fM combined, PRESSING LONG)" % (uniq, press_long / 1e6))
 
     if direction:
-        bias_agrees = (direction == "SHORT" and sc < -0.5) or (direction == "LONG" and sc > 0.5)
-        conf = "zyada" if (bias_agrees and uniq >= 3) else "medium" if (bias_agrees or uniq >= 3) else "halki"
-        if bias_agrees:
-            why.append("overall bias bhi isi (%s) taraf hai (score %+.1f)" % (direction, sc))
+        bias_strongly_opposes = (direction == "SHORT" and sc >= 3) or (direction == "LONG" and sc <= -3)
+        if bias_strongly_opposes:
+            # Ek-do chhote whale ke akele pressing karne se "setup" mat bolo jab poora footprint
+            # (ABSORB/BURST/etc, jo bias score banate hain) usse ULTA strongly keh raha ho.
+            why.append("%s whale pressing hai, PAR overall footprint bias strongly ulta (%s, score %+.1f) hai -- contradict karta hai, isliye clean setup NAHI maan raha" %
+                       (direction, label, sc))
+            direction = None
         else:
-            why.append("par overall bias (%s, score %+.1f) isse match nahi karta -- mixed signal" % (label, sc))
-    elif sc > 0.5 or sc < -0.5:
+            bias_agrees = (direction == "SHORT" and sc < -0.5) or (direction == "LONG" and sc > 0.5)
+            conf = "zyada" if (bias_agrees and uniq >= 3) else "medium" if (bias_agrees or uniq >= 3) else "halki"
+            if bias_agrees:
+                why.append("overall bias bhi isi (%s) taraf hai (score %+.1f)" % (direction, sc))
+            else:
+                why.append("par overall bias (%s, score %+.1f) isse match nahi karta -- mixed signal" % (label, sc))
+    if not direction and (sc > 0.5 or sc < -0.5):
         direction = "LONG" if sc > 0 else "SHORT"
         conf = "sirf-bias"
         why.append("koi whale clearly press nahi kar raha, sirf overall footprint bias (score %+.1f) se" % sc)
