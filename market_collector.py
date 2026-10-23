@@ -165,7 +165,7 @@ def c_options(H):
     if not btc_opts:
         return {}
 
-    now_dt = datetime.datetime.utcnow()
+    now_dt = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)  # naya Python me utcnow() deprecated hai
     future = [p for p in btc_opts if datetime.datetime.strptime(p["settlement_time"][:19], "%Y-%m-%dT%H:%M:%S") > now_dt]
     pool = future or btc_opts
     nearest_exp = min(p["settlement_time"] for p in pool)
