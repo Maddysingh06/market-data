@@ -58,6 +58,29 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def whale_conviction(con):
+    w = con.execute("SELECT addr, szi, usd, MAX(ts) FROM w GROUP BY addr").fetchall()
+    c = con.execute("SELECT addr, label, MAX(ts) FROM c GROUP BY addr").fetchall()
+    clab = {a: lab for a, lab, _ in c}
+    out = []
+    for addr, szi, usd, _ in w:
+        lab = clab.get(addr)
+        if lab not in ("TREND-BUY", "TREND-SELL") or szi is None:
+            continue
+        pos_long = szi > 0
+        flow_buy = lab == "TREND-BUY"
+        if pos_long and flow_buy:
+            verdict, cls = "PRESSING LONG", "up"
+        elif pos_long and not flow_buy:
+            verdict, cls = "LONG covering/exit", "dn"
+        elif (not pos_long) and not flow_buy:
+            verdict, cls = "PRESSING SHORT", "dn"
+        else:
+            verdict, cls = "SHORT covering/exit", "up"
+        out.append((addr, "LONG" if pos_long else "SHORT", usd, verdict, cls))
+    return out
+
+
 def render():
     con = sqlite3.connect(DB)
     now = time.time()
@@ -118,6 +141,16 @@ def render():
             side = "LONG" if szi > 0 else "SHORT"
             cls = "up" if szi > 0 else "dn"
             lines.append("<div class='wrow %s'>%s..%s %s %.2f BTC @ %.0f ($%.1fM)</div>" % (cls, a[:6], a[-4:], side, abs(szi), e or 0, usd / 1e6))
+        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+
+    conv = whale_conviction(con)
+    if conv:
+        lines = ["<div class='hdr'>Whale conviction (position+flow, dedup)</div>"]
+        for a, side, usd, verdict, cls in conv:
+            lines.append("<div class='wrow %s'>%s..%s %s $%.1fM -> <b>%s</b></div>" % (cls, a[:6], a[-4:], side, (usd or 0) / 1e6, verdict))
+        uniq = len(set(x[0] for x in conv))
+        if uniq < 3:
+            lines.append("<div class='small' style='color:#f59e0b'>SAVDHAN: sirf %d alag wallet(s) se, 'market' mat samjho, chhota sample</div>" % uniq)
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     con.close()
