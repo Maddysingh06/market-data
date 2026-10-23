@@ -228,6 +228,29 @@ def trade_plan(con, now):
     return plan
 
 
+def buy_sell_pressure(con):
+    """'Fighting bar' -- abhi ke real BUY flow vs SELL flow ko milake ek bar banata hai.
+    Sirf FLOW wala data use karta hai (kitna abhi khareeda/becha ja raha hai), POSITION/OI wala nahi
+    (jaise GMX/HL whale long-short) -- wo 'kitna bada stock hai' batata hai, 'abhi kaun jeet raha hai' nahi."""
+    L = latest(con)
+    g = lambda s, k: (L[(s, k)][0] if (s, k) in L else None)
+    buy = sell = 0.0
+    got = False
+    hb, hs = g("hyperliquid", "big_buy_usd"), g("hyperliquid", "big_sell_usd")
+    if hb is not None and hs is not None:
+        buy += hb; sell += hs; got = True
+    tb, ts_ = g("hyperliquid", "trend_buy_usd"), g("hyperliquid", "trend_sell_usd")
+    if tb is not None and ts_ is not None:
+        buy += tb; sell += ts_; got = True
+    db_, ds_ = g("dydx", "recent_buy_usd"), g("dydx", "recent_sell_usd")
+    if db_ is not None and ds_ is not None:
+        buy += db_; sell += ds_; got = True
+    if not got or (buy + sell) <= 0:
+        return None
+    pct = buy / (buy + sell) * 100
+    return buy, sell, pct
+
+
 def plain_setup(con, now):
     """Sabse upar dikhne wala, EASY-SAMAJH wala summary: whale pressing + bias + SR/volatility
     milake ek seedha-saadha 'setup bun raha hai ya nahi' paragraph banata hai, Entry/SL/TP/wait-time ke saath.
@@ -300,6 +323,22 @@ def render():
     rows_html.append("<div class='price'>BTC $%s</div>" % (("%.0f" % mark) if mark else "--"))
     if stale:
         rows_html.append("<div class='warn'>DATA %.0f MIN PURANA -- collector check karo</div>" % (data_age / 60))
+
+    bsp = buy_sell_pressure(con)
+    if bsp:
+        buy, sell, pct = bsp
+        heavier = "BUYERS BHAARI" if pct > 55 else "SELLERS BHAARI" if pct < 45 else "BARABAR (koi heavy nahi)"
+        hcol = "#4ade80" if pct > 55 else "#f87171" if pct < 45 else "#999"
+        rows_html.append(
+            "<div class='box' style='padding:10px 12px'>"
+            "<div class='hdr'>FIGHTING BAR (abhi ka real buy vs sell flow)</div>"
+            "<div style='display:flex;height:22px;border-radius:5px;overflow:hidden;margin:4px 0'>"
+            "<div style='width:%.1f%%;background:#1b7a3a'></div>"
+            "<div style='width:%.1f%%;background:#b02a2a'></div>"
+            "</div>"
+            "<div class='small'>BUY $%.1fM (%.0f%%) &nbsp;vs&nbsp; SELL $%.1fM (%.0f%%)</div>"
+            "<div style='font-weight:700;color:%s;margin-top:2px'>%s</div>"
+            "</div>" % (pct, 100 - pct, buy / 1e6, pct, sell / 1e6, 100 - pct, hcol, heavier))
 
     ps = plain_setup(con, now)
     confcol = {"zyada": "#1b7a3a", "medium": "#8a6d1b", "halki": "#555", "sirf-bias": "#555"}
@@ -438,11 +477,12 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Footprint Live</title>
 <style>
-body{background:#0b0b0f;color:#eee;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:12px;max-width:480px}
-.price{font-size:30px;font-weight:700;margin:4px 0}
-.warn{background:#b02a2a;padding:6px 10px;border-radius:6px;margin-bottom:8px;font-size:13px}
-.bias{padding:10px 12px;border-radius:8px;margin-bottom:10px;line-height:1.5}
-.box{background:#17171c;border-radius:8px;padding:10px 12px;margin-bottom:10px}
+body{background:#0b0b0f;color:#eee;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:12px;max-width:1400px}
+#app{column-width:440px;column-gap:18px}
+.price{font-size:30px;font-weight:700;margin:4px 0 10px 0;break-inside:avoid;-webkit-column-break-inside:avoid}
+.warn{background:#b02a2a;padding:6px 10px;border-radius:6px;margin-bottom:10px;font-size:13px;break-inside:avoid;-webkit-column-break-inside:avoid}
+.bias{padding:10px 12px;border-radius:8px;margin-bottom:10px;line-height:1.5;break-inside:avoid;-webkit-column-break-inside:avoid}
+.box{background:#17171c;border-radius:8px;padding:10px 12px;margin-bottom:10px;break-inside:avoid;-webkit-column-break-inside:avoid}
 .hdr{color:#888;font-size:12px;text-transform:uppercase;margin-bottom:6px}
 .small{font-size:12px;opacity:.85}
 .ev{font-size:13px;padding:3px 0;border-bottom:1px solid #222}
