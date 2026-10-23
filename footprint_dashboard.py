@@ -58,6 +58,19 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def track_record(con):
+    try:
+        rows = con.execute("SELECT eval15,eval30,eval60 FROM setups").fetchall()
+    except Exception:
+        return {}, 0
+    out = {}
+    for i, col in enumerate(("15min", "30min", "60min")):
+        vals = [r[i] for r in rows if r[i] is not None]
+        h, m, fl = vals.count("HIT"), vals.count("MISS"), vals.count("FLAT")
+        out[col] = (h, m, fl, len(vals))
+    return out, len(rows)
+
+
 def whale_conviction(con):
     w = con.execute("SELECT addr, szi, usd, MAX(ts) FROM w GROUP BY addr").fetchall()
     c = con.execute("SELECT addr, label, MAX(ts) FROM c GROUP BY addr").fetchall()
@@ -152,6 +165,20 @@ def render():
         if uniq < 3:
             lines.append("<div class='small' style='color:#f59e0b'>SAVDHAN: sirf %d alag wallet(s) se, 'market' mat samjho, chhota sample</div>" % uniq)
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+
+    tr, total_setups = track_record(con)
+    lines = ["<div class='hdr'>Track record (3+ wallet confluence, khud test)</div>"]
+    if total_setups == 0:
+        lines.append("<div class='small'>abhi koi setup log nahi hua</div>")
+    else:
+        for win, (h, m, fl, n) in tr.items():
+            if n == 0:
+                lines.append("<div class='small'>%s: abhi evaluate hone wala koi nahi</div>" % win)
+            else:
+                warn = " -- bahut kam sample" if n < 20 else ""
+                lines.append("<div class='small'>%s: %d HIT / %d MISS / %d FLAT (%d eval, %.0f%% hit)%s</div>" % (win, h, m, fl, n, h / n * 100, warn))
+        lines.append("<div class='small' style='color:#666'>total setups log hue: %d</div>" % total_setups)
+    rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     con.close()
     return "\n".join(rows_html), stale

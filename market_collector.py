@@ -159,8 +159,11 @@ def db():
     con.execute("CREATE TABLE IF NOT EXISTS w(ts INT, addr TEXT, szi REAL, entry REAL, liq REAL, upnl REAL, lev REAL, usd REAL, flow REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS e(ts INT, venue TEXT, kind TEXT, side TEXT, a REAL, b REAL, note TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS c(ts INT, addr TEXT, label TEXT, bought REAL, sold REAL, maker_n REAL, taker_n REAL, n REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS setups(ts INT, direction TEXT, entry REAL, n_wallets INT, net_score REAL, "
+                "eval15 TEXT, px15 REAL, eval30 TEXT, px30 REAL, eval60 TEXT, px60 REAL)")
     con.execute("CREATE INDEX IF NOT EXISTS im ON m(src,k,ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ie ON e(ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS is_ ON setups(ts)")
     return con
 
 
@@ -638,6 +641,69 @@ def whale_conviction(con, now):
     return out
 
 
+SETUP_MIN_WALLETS = 3
+SETUP_MAJORITY = 0.6     # 60% ya zyada wallets ek disha me ho
+SETUP_COOLDOWN = 900     # ek disha me dubara log karne se pehle 15 min ruko
+TRACK_MOVE = SR_REV_MOVE  # hit/miss ke liye itna move chahiye
+
+
+def current_mark(con, src="binance"):
+    r = con.execute("SELECT v FROM m WHERE src=? AND k='mark' ORDER BY ts DESC LIMIT 1", (src,)).fetchone()
+    return r[0] if r else None
+
+
+def log_setup(con, now):
+    conv = whale_conviction(con, now)
+    if not conv:
+        return
+    uniq_addrs = set(x[0] for x in conv)
+    uniq = len(uniq_addrs)
+    if uniq < SETUP_MIN_WALLETS:
+        return
+    net = sum(x[4] for x in conv)
+    if abs(net) < uniq * SETUP_MAJORITY:
+        return   # clean majority nahi, skip
+    direction = "BULL" if net > 0 else "BEAR"
+    last = con.execute("SELECT ts FROM setups WHERE direction=? ORDER BY ts DESC LIMIT 1", (direction,)).fetchone()
+    if last and now - last[0] < SETUP_COOLDOWN:
+        return
+    px = current_mark(con)
+    if px is None:
+        return
+    with LOCK:
+        con.execute("INSERT INTO setups(ts,direction,entry,n_wallets,net_score) VALUES(?,?,?,?,?)",
+                   (int(now), direction, px, uniq, net))
+    print("SETUP LOGGED: %s @ %.0f (%d wallets, net %+.1f)" % (direction, px, uniq, net), flush=True)
+    tg_send("SETUP: %s @ %.0f (%d alag wallets agree, net %+.1f)\n15/30/60 min me check hoga ki sahi nikla ya nahi" % (direction, px, uniq, net))
+
+
+def evaluate_setups(con, now):
+    px = current_mark(con)
+    if px is None:
+        return
+    for col_eval, col_px, win in (("eval15", "px15", 900), ("eval30", "px30", 1800), ("eval60", "px60", 3600)):
+        rows = con.execute("SELECT rowid,direction,entry FROM setups WHERE %s IS NULL AND ts<=?" % col_eval,
+                           (int(now) - win,)).fetchall()
+        for rowid, direction, entry in rows:
+            move = px - entry
+            if direction == "BULL":
+                verdict = "HIT" if move > TRACK_MOVE else "MISS" if move < -TRACK_MOVE else "FLAT"
+            else:
+                verdict = "HIT" if move < -TRACK_MOVE else "MISS" if move > TRACK_MOVE else "FLAT"
+            with LOCK:
+                con.execute("UPDATE setups SET %s=?, %s=? WHERE rowid=?" % (col_eval, col_px), (verdict, px, rowid))
+
+
+def track_record(con):
+    rows = con.execute("SELECT eval15,eval30,eval60 FROM setups").fetchall()
+    out = {}
+    for i, col in enumerate(("15min", "30min", "60min")):
+        vals = [r[i] for r in rows if r[i] is not None]
+        h, m, f = vals.count("HIT"), vals.count("MISS"), vals.count("FLAT")
+        out[col] = (h, m, f, len(vals))
+    return out, len(rows)
+
+
 def print_sr(con, now):
     near, npoints = sr_zones(con, now)
     print("\n--- SUPPORT/RESISTANCE ZONES (%s price-points se, itna kam data noise hai) ---" % npoints)
@@ -703,6 +769,18 @@ def report(con):
     else:
         print("   abhi koi wallet nahi jiska position + flow dono mile")
     print("   (pichhle 30 min me HL events %d alag wallets se aaye)" % len(actors))
+    tr, total_setups = track_record(con)
+    print("\n--- TRACK RECORD (3+ wallet confluence, khud test) ---")
+    if total_setups == 0:
+        print("   abhi koi setup log nahi hua")
+    else:
+        for win, (h, m, fl, n) in tr.items():
+            if n == 0:
+                print("   %s: abhi evaluate hone wala koi nahi" % win)
+            else:
+                print("   %s: %d HIT / %d MISS / %d FLAT (%d evaluated, %.0f%% hit) %s" %
+                      (win, h, m, fl, n, h / n * 100, "-- bahut kam sample, bharosa mat karo" if n < 20 else ""))
+        print("   (total setups log hue: %d)" % total_setups)
     ev = con.execute("SELECT ts,venue,kind,side,note FROM e WHERE ts>? ORDER BY ts DESC LIMIT 10", (int(now) - 1800,)).fetchall()
     if ev:
         print("\nPichhle 30 min ke events:")
@@ -747,6 +825,8 @@ def run():
         if time.time() - last_state > STATE_EVERY:
             wh.poll_state(ts)
             last_state = time.time()
+        log_setup(con, time.time())
+        evaluate_setups(con, time.time())
         sc, label, parts = bias_calc(con, time.time())
         put(con, ts, "footprint", "bias_score", sc)
         if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
