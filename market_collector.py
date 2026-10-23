@@ -24,7 +24,7 @@ Zaroori: pip3 install requests websocket-client --break-system-packages
 NOTE: sandbox me exchanges blocked the, isliye asli endpoints/fields yahan test nahi hue.
 Pehle run me jo source "ERR" dikhaye wo mujhe batao.
 """
-import os, sys, time, json, sqlite3, threading, collections, random
+import os, sys, time, json, sqlite3, threading, collections, random, datetime
 import requests
 
 TG_TOKEN, TG_CHAT = os.getenv("TG_TOKEN"), os.getenv("TG_CHAT")
@@ -148,6 +148,55 @@ def c_delta(H):
     return {"mark": f(r.get("mark_price")), "funding": f(r.get("funding_rate")), "oi": f(r.get("oi"))}
 
 
+def c_options(H):
+    # Delta India options chain -- NEAREST expiry ka ATM implied volatility + total options OI,
+    # taaki option-selling view me REAL IV ko hamare realized-volatility se compare kar sakein.
+    # SACH: field names (settlement_time, quotes.bid_iv/ask_iv, strike_price, underlying_asset.symbol)
+    # Delta ke public docs se liye hain, apne live response ke against verify NAHI kiya abhi --
+    # pehli baar tere server pe chalega. ERR aaye to raw output paste karna, field name theek kar dunga.
+    spot_r = H("GET", "https://api.india.delta.exchange/v2/tickers/BTCUSD")["result"]
+    spot = f(spot_r.get("mark_price"))
+    if spot is None:
+        return {}
+
+    prods = H("GET", "https://api.india.delta.exchange/v2/products",
+             params={"contract_types": "call_options,put_options", "page_size": 500})["result"]
+    btc_opts = [p for p in prods if (p.get("underlying_asset") or {}).get("symbol") == "BTC" and p.get("settlement_time")]
+    if not btc_opts:
+        return {}
+
+    now_dt = datetime.datetime.utcnow()
+    future = [p for p in btc_opts if datetime.datetime.strptime(p["settlement_time"][:19], "%Y-%m-%dT%H:%M:%S") > now_dt]
+    pool = future or btc_opts
+    nearest_exp = min(p["settlement_time"] for p in pool)
+    exp_dt = datetime.datetime.strptime(nearest_exp[:19], "%Y-%m-%dT%H:%M:%S")
+    days_to_exp = (exp_dt - now_dt).total_seconds() / 86400
+
+    tick = H("GET", "https://api.india.delta.exchange/v2/tickers",
+             params={"contract_types": "call_options,put_options",
+                     "underlying_asset_symbols": "BTC",
+                     "expiry_date": exp_dt.strftime("%d-%m-%Y")})["result"]
+
+    by_strike, total_oi = {}, 0.0
+    for t in tick:
+        strike = f(t.get("strike_price"))
+        if strike is None:
+            continue
+        q = t.get("quotes") or {}
+        biv, aiv = f(q.get("bid_iv")), f(q.get("ask_iv"))
+        iv = ((biv or 0) + (aiv or 0)) / 2 if (biv is not None and aiv is not None) else (biv if biv is not None else aiv)
+        total_oi += f(t.get("oi")) or 0
+        if iv is not None:
+            by_strike.setdefault(strike, []).append(iv)
+
+    out = {"days_to_expiry": days_to_exp, "total_oi": total_oi}
+    if by_strike:
+        atm_strike = min(by_strike.keys(), key=lambda k: abs(k - spot))
+        out["atm_iv"] = sum(by_strike[atm_strike]) / len(by_strike[atm_strike])
+        out["atm_strike"] = atm_strike
+    return out
+
+
 def c_dydx(H):
     # dYdX v4 -- isliye jodh raha hu kyunki Hyperliquid jaisa hi ON-CHAIN hai, isliye range badhti hai.
     # SACH: ye endpoint maine verify nahi kiya real response ke against -- pehli baar chalega tere server pe.
@@ -220,7 +269,7 @@ def c_depth(H):
 
 SRC = {"binance": c_binance, "bybit": c_bybit, "okx": c_okx, "hyperliquid": c_hyper,
        "coinbase": c_coinbase, "deribit": c_deribit, "delta": c_delta, "dydx": c_dydx, "gmx": c_gmx,
-       "depth": c_depth}
+       "depth": c_depth, "options": c_options}
 
 
 # ------------- DB -------------
@@ -239,10 +288,16 @@ def db():
                 "coinbase_premium REAL, top_ls REAL, retail_ls REAL, "
                 "dydx_net REAL, gmx_net REAL, orderbook_imb REAL, bias_score REAL, "
                 "px15 REAL, px30 REAL, px60 REAL)")
+    # trendline_log -- 4 ALAG "chota-timeframe-window" variants ek saath track karte hain
+    # (1h/4h/8h/24h), taaki baad me dekh sakein konsa window genuinely accurate trendline deta hai
+    con.execute("CREATE TABLE IF NOT EXISTS trendline_log(ts INT, variant TEXT, price REAL, "
+                "support_line REAL, resistance_line REAL, support_broken INT, resistance_broken INT, "
+                "px15 REAL, px30 REAL, px60 REAL)")
     con.execute("CREATE INDEX IF NOT EXISTS im ON m(src,k,ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ie ON e(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS is_ ON setups(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ifl ON factor_log(ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS itl ON trendline_log(ts, variant)")
     for stmt in ("ALTER TABLE setups ADD COLUMN eval240 TEXT", "ALTER TABLE setups ADD COLUMN px240 REAL"):
         try:
             con.execute(stmt)
@@ -672,6 +727,91 @@ def evaluate_factors(con, now):
         for (rowid,) in rows:
             with LOCK:
                 con.execute("UPDATE factor_log SET %s=? WHERE rowid=?" % col, (px, rowid))
+
+
+# ------------- trendline check -- kaunsa "chota timeframe window" genuinely accurate hai, isko validate karne ke liye -------------
+def _resample_ohlc(rows, bucket_sec):
+    """rows = [(ts,price), ...] sorted by ts -> sorted [(bucket_ts, [o,h,l,c]), ...]"""
+    buckets = {}
+    for ts, px in rows:
+        b = int(ts // bucket_sec) * bucket_sec
+        if b not in buckets:
+            buckets[b] = [px, px, px, px]
+        else:
+            o, h, l, c = buckets[b]
+            buckets[b] = [o, max(h, px), min(l, px), px]
+    return sorted(buckets.items())
+
+
+def _project_line(tA, pA, tB, pB, t_now):
+    if tA == tB:
+        return None
+    t1, p1 = (tA, pA) if tA < tB else (tB, pB)
+    t2, p2 = (tB, pB) if tA < tB else (tA, pA)
+    slope = (p2 - p1) / (t2 - t1)
+    return p1 + slope * (t_now - t1)
+
+
+def trendline_break(con, now, src="binance", big_bucket=3600, small_bucket=300, small_lookback=14400):
+    """Ek PURANA/BADA extreme point (jitna data hai utna, big_bucket candles se) + ek
+    RECENT/CHOTA extreme point (small_lookback window, small_bucket candles se) jodke trendline.
+    SACH: kaunsa small_lookback (1h/4h/8h/24h) sabse accurate hai, ye GUESS hai -- isiliye
+    log_trendline() neeche 4 variants ek saath track karta hai, taaki data se pata chale."""
+    rows = con.execute("SELECT ts,v FROM m WHERE src=? AND k='mark' ORDER BY ts", (src,)).fetchall()
+    if len(rows) < 50:
+        return None
+    cur_px = rows[-1][1]
+    big_candles = _resample_ohlc(rows, big_bucket)
+    small_rows = [(ts, v) for ts, v in rows if ts >= now - small_lookback]
+    small_candles = _resample_ohlc(small_rows, small_bucket)
+    if len(big_candles) < 3 or len(small_candles) < 3:
+        return None
+    big_low_ts, big_low = min(((t, c[2]) for t, c in big_candles), key=lambda x: x[1])
+    small_low_ts, small_low = min(((t, c[2]) for t, c in small_candles), key=lambda x: x[1])
+    support = _project_line(big_low_ts, big_low, small_low_ts, small_low, now)
+    big_high_ts, big_high = max(((t, c[1]) for t, c in big_candles), key=lambda x: x[1])
+    small_high_ts, small_high = max(((t, c[1]) for t, c in small_candles), key=lambda x: x[1])
+    resistance = _project_line(big_high_ts, big_high, small_high_ts, small_high, now)
+    return {"cur": cur_px, "support_line": support, "resistance_line": resistance,
+            "support_broken": support is not None and cur_px < support,
+            "resistance_broken": resistance is not None and cur_px > resistance}
+
+
+TL_VARIANTS = {"1h": 3600, "4h": 14400, "8h": 28800, "24h": 86400}  # chota-timeframe lookback options
+TL_COOLDOWN = 120  # har 2 min me ek row per variant
+
+
+def log_trendline(con, now):
+    """Har TL_VARIANTS option (chota-window 1h/4h/8h/24h) ko ALAG row me log karta hai --
+    baad me trendline_accuracy.py se dekhenge konsa window genuinely sahi predict karta hai."""
+    px = current_mark(con)
+    if px is None:
+        return
+    last = con.execute("SELECT ts FROM trendline_log ORDER BY ts DESC LIMIT 1").fetchone()
+    if last and now - last[0] < TL_COOLDOWN:
+        return
+    for variant, lookback in TL_VARIANTS.items():
+        tl = trendline_break(con, now, small_lookback=lookback)
+        if tl is None:
+            continue
+        with LOCK:
+            con.execute("INSERT INTO trendline_log(ts,variant,price,support_line,resistance_line,"
+                       "support_broken,resistance_broken) VALUES(?,?,?,?,?,?,?)",
+                       (int(now), variant, tl["cur"], tl["support_line"], tl["resistance_line"],
+                        int(tl["support_broken"]), int(tl["resistance_broken"])))
+
+
+def evaluate_trendline(con, now):
+    """trendline_log ke purane rows me forward price (15/30/60 min baad) bhar deta hai."""
+    px = current_mark(con)
+    if px is None:
+        return
+    for col, win in (("px15", 900), ("px30", 1800), ("px60", 3600)):
+        rows = con.execute("SELECT rowid FROM trendline_log WHERE %s IS NULL AND ts<=?" % col,
+                           (int(now) - win,)).fetchall()
+        for (rowid,) in rows:
+            with LOCK:
+                con.execute("UPDATE trendline_log SET %s=? WHERE rowid=?" % col, (px, rowid))
 
 
 # ------------- paisa flow synthesis (price + OI milake) -------------
@@ -1216,6 +1356,8 @@ def run():
         evaluate_setups(con, time.time())
         log_factors(con, time.time())
         evaluate_factors(con, time.time())
+        log_trendline(con, time.time())
+        evaluate_trendline(con, time.time())
         sc, label, parts = bias_calc(con, time.time())
         put(con, ts, "footprint", "bias_score", sc)
         if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
