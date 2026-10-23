@@ -284,6 +284,64 @@ def buy_sell_pressure(con):
     return buy, sell, pct
 
 
+def breakout_check(con, now):
+    """Jab price kisi resistance (ASK wall ya SR zone) ke bilkul paas ho, abhi ke flow/wall/whale
+    data ko milake ek 'kitna dum hai' composite check deta hai -- SACH: ye koi proven probability
+    nahi hai, sirf heuristic hai. Agar price resistance ke paas nahi hai to None deta hai."""
+    px = current_mark(con)
+    if px is None:
+        return None
+    L = latest(con)
+    g = lambda s, k: (L[(s, k)][0] if (s, k) in L else None)
+
+    aw_px = g("depth", "ask_wall_px")
+    near_wall = aw_px is not None and 0 < (aw_px - px) / px < 0.004   # wall 0.4% ke andar upar
+
+    near = sr_zones(con, now)
+    zone_res = None
+    if near:
+        for z, st in near:
+            if z >= px and (z - px) / px < 0.006 and st["touch"] >= 5 and st["down"] / st["touch"] >= 0.5:
+                zone_res = (z, st)
+                break
+
+    if not near_wall and not zone_res:
+        return None
+
+    bsp = buy_sell_pressure(con)
+    buy_pct = bsp[2] if bsp else None
+    ww = wall_watch(con, now)
+    wall_status = ww.get("ask", (None,))[0] if ww else None
+    conv = whale_conviction(con)
+    press_long = sum((x[2] or 0) for x in conv if x[3] == "PRESSING LONG")
+    press_short = sum((x[2] or 0) for x in conv if x[3] == "PRESSING SHORT")
+
+    score, reasons = 0, []
+    if buy_pct is not None:
+        if buy_pct > 55:
+            score += 1; reasons.append("buy flow bhaari hai (%.0f%%)" % buy_pct)
+        elif buy_pct < 45:
+            score -= 1; reasons.append("sell flow bhaari hai (%.0f%%)" % buy_pct)
+    if wall_status == "EATEN/CHHOTA HO GAYA":
+        score += 1; reasons.append("ask wall chhota ho raha hai")
+    elif wall_status == "ABHI BHI KHADA HAI":
+        score -= 1; reasons.append("ask wall abhi poora khada hai")
+    if press_long > 0 and press_long >= press_short * 1.3:
+        score += 1; reasons.append("whales long press kar rahe hain")
+    elif press_short > 0 and press_short >= press_long * 1.3:
+        score -= 1; reasons.append("whales short press kar rahe hain -- bounce zyada likely")
+
+    if score >= 2:
+        verdict, col = "DUM DIKH RAHA HAI -- tod sakta hai", "#4ade80"
+    elif score <= -2:
+        verdict, col = "KAM DUM -- reject/bounce zyada likely", "#f87171"
+    else:
+        verdict, col = "MIXED -- abhi 50-50, clear nahi", "#999"
+
+    level = aw_px if near_wall else zone_res[0]
+    return {"level": level, "price": px, "verdict": verdict, "col": col, "reasons": reasons}
+
+
 def plain_setup(con, now):
     """Sabse upar dikhne wala, EASY-SAMAJH wala summary: whale pressing + bias + SR/volatility
     milake ek seedha-saadha 'setup bun raha hai ya nahi' paragraph banata hai, Entry/SL/TP/wait-time ke saath.
@@ -391,6 +449,17 @@ def render():
         else:
             lines.append("<div class='small' style='color:#666'>(history ke liye abhi kam data hai)</div>")
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+
+    bc = breakout_check(con, now)
+    if bc:
+        lines = ["<div class='hdr'>BREAKOUT CHECK (price resistance $%.0f ke paas hai)</div>" % bc["level"],
+                 "<div style='font-weight:700;color:%s'>%s</div>" % (bc["col"], bc["verdict"])]
+        if bc["reasons"]:
+            lines.append("<div class='small' style='margin-top:4px'>" + esc("; ".join(bc["reasons"])) + "</div>")
+        else:
+            lines.append("<div class='small' style='color:#666'>abhi koi clear supporting data nahi, MIXED hi hai</div>")
+        lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: ye proven probability NAHI hai, sirf abhi ke flow+wall+whale ko milake ek quick-check hai.</div>")
+        rows_html.append("<div class='box' style='border:1px solid #666'>" + "".join(lines) + "</div>")
 
     ps = plain_setup(con, now)
     confcol = {"zyada": "#1b7a3a", "medium": "#8a6d1b", "halki": "#555", "sirf-bias": "#555"}
