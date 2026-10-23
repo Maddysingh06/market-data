@@ -173,6 +173,14 @@ def put(con, ts, src, k, v):
             con.execute("INSERT INTO m VALUES(?,?,?,?)", (int(ts), src, k, v))
 
 
+def price_move(con, ts, window, src="binance"):
+    r1 = con.execute("SELECT v FROM m WHERE src=? AND k='mark' AND ts<=? ORDER BY ts DESC LIMIT 1", (src, int(ts) - window)).fetchone()
+    r2 = con.execute("SELECT v FROM m WHERE src=? AND k='mark' AND ts<=? ORDER BY ts DESC LIMIT 1", (src, int(ts))).fetchone()
+    if not r1 or not r2:
+        return None
+    return r2[0] - r1[0]
+
+
 def put_event(con, ts, venue, kind, side, a, b, note):
     with LOCK:
         con.execute("INSERT INTO e VALUES(?,?,?,?,?,?,?)", (int(ts), venue, kind, side, a, b, note))
@@ -218,10 +226,10 @@ class Tape:
             ts = (b["m"] + 1) * 60
             if b["sell"] >= max(ABS_MIN_BTC, ABS_MULT * avg_s) and move > -ABS_MOVE_ATR * atr:
                 put_event(self.con, ts, self.venue, "ABSORB", "BULL", b["sell"], move,
-                          "bhaari bikri %.0f BTC par price nahi gira (neeche koi le raha)" % b["sell"])
+                          "bhaari bikri %.0f BTC par price nahi gira (neeche koi le raha) (price %+.0f pts is 1 min me)" % (b["sell"], move))
             if b["buy"] >= max(ABS_MIN_BTC, ABS_MULT * avg_b) and move < ABS_MOVE_ATR * atr:
                 put_event(self.con, ts, self.venue, "ABSORB", "BEAR", b["buy"], move,
-                          "bhaari kharid %.0f BTC par price nahi chadha (upar koi bech raha)" % b["buy"])
+                          "bhaari kharid %.0f BTC par price nahi chadha (upar koi bech raha) (price %+.0f pts is 1 min me)" % (b["buy"], move))
         self.hist.append(dict(rng=rng, buy=b["buy"], sell=b["sell"]))
 
     def scan(self, now):
@@ -351,8 +359,10 @@ class Whales:
             items, self.pending = self.pending, []
         for addr, net, ts in items:
             side = "BULL" if net > 0 else "BEAR"
-            put_event(self.con, ts, "hyperliquid", "BURST", side, abs(net), 0,
-                      "wallet %s..%s ne 1 min me $%.2fM %s" % (addr[:6], addr[-4:], abs(net) / 1e6, "kharida" if net > 0 else "becha"))
+            dp = price_move(self.con, ts, BURST_WIN)
+            pts = (" (price %+.0f pts)" % dp) if dp is not None else ""
+            put_event(self.con, ts, "hyperliquid", "BURST", side, abs(net), dp or 0,
+                      "wallet %s..%s ne 1 min me $%.2fM %s%s" % (addr[:6], addr[-4:], abs(net) / 1e6, "kharida" if net > 0 else "becha", pts))
             try:
                 st = self.H("POST", HL, json={"type": "clearinghouseState", "user": addr})
                 for ap in st.get("assetPositions", []):
@@ -593,6 +603,41 @@ def sr_zones(con, now, src="binance", lookback=SR_LOOK_FWD * 40):
     return near, n
 
 
+def distinct_actors(con, now, window=1800):
+    import re
+    rows = q(con, "SELECT note FROM e WHERE ts>? AND venue='hyperliquid'", (int(now) - window,)) if False else \
+           con.execute("SELECT note FROM e WHERE ts>? AND venue='hyperliquid'", (int(now) - window,)).fetchall()
+    addrs = set()
+    for (note,) in rows:
+        m = re.search(r"wallet (\S+)", note)
+        if m:
+            addrs.add(m.group(1))
+    return addrs
+
+
+def whale_conviction(con, now):
+    w = con.execute("SELECT addr, szi, usd, MAX(ts) FROM w GROUP BY addr").fetchall()
+    c = con.execute("SELECT addr, label, MAX(ts) FROM c GROUP BY addr").fetchall()
+    clab = {a: lab for a, lab, _ in c}
+    out = []
+    for addr, szi, usd, _ in w:
+        lab = clab.get(addr)
+        if lab not in ("TREND-BUY", "TREND-SELL") or szi is None:
+            continue
+        pos_long = szi > 0
+        flow_buy = lab == "TREND-BUY"
+        if pos_long and flow_buy:
+            verdict, sign = "PRESSING LONG (aur bada rahah hai)", 1
+        elif pos_long and not flow_buy:
+            verdict, sign = "LONG KAM KAR RAHA (covering/exit)", -1
+        elif (not pos_long) and not flow_buy:
+            verdict, sign = "PRESSING SHORT (aur bada rahah hai)", -1
+        else:
+            verdict, sign = "SHORT KAM KAR RAHA (covering/exit)", 1
+        out.append((addr, "LONG" if pos_long else "SHORT", usd, verdict, sign))
+    return out
+
+
 def print_sr(con, now):
     near, npoints = sr_zones(con, now)
     print("\n--- SUPPORT/RESISTANCE ZONES (%s price-points se, itna kam data noise hai) ---" % npoints)
@@ -641,6 +686,23 @@ def report(con):
     print("\n--- PAISA FLOW (15 min, price+OI) ---")
     print(synthesize(con, now))
     print_sr(con, now)
+
+    print("\n--- WHALE CONVICTION (position + flow milake, dedup) ---")
+    conv = whale_conviction(con, now)
+    actors = distinct_actors(con, now)
+    if conv:
+        net = sum(x[4] for x in conv)
+        for addr, side, usd, verdict, sign in conv:
+            print("   %s..%s %s $%.1fM -> %s" % (addr[:6], addr[-4:], side, (usd or 0) / 1e6, verdict))
+        uniq = len(set(x[0] for x in conv))
+        if uniq < 3:
+            print("   SAVDHAN: ye sirf %d alag wallet(s) se aa raha hai. 'Market bearish/bullish' mat samjho," % uniq)
+            print("   ye 'chand bade khiladi ek disha me press kar rahe hain' hai -- alag baat hai, chhota sample.")
+        else:
+            print("   net conviction: %+d (%d alag wallets)" % (net, uniq))
+    else:
+        print("   abhi koi wallet nahi jiska position + flow dono mile")
+    print("   (pichhle 30 min me HL events %d alag wallets se aaye)" % len(actors))
     ev = con.execute("SELECT ts,venue,kind,side,note FROM e WHERE ts>? ORDER BY ts DESC LIMIT 10", (int(now) - 1800,)).fetchall()
     if ev:
         print("\nPichhle 30 min ke events:")
