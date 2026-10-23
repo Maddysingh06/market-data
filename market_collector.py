@@ -32,7 +32,9 @@ EVERY = 60
 BIG_USD = 300_000
 WHALE_MIN_USD = 1_000_000
 TOP_N = 20
-STATE_EVERY = 300
+STATE_EVERY = 60      # wallet position poll (pehle 300)
+SLOW_EVERY = 300      # labels/decay
+BURST_USD, BURST_WIN, BURST_COOL = 500_000, 60, 180
 HL = "https://api.hyperliquid.xyz/info"
 # footprint parameters (meri guess, badal sakte ho)
 SLICE_MIN_USD, SLICE_MIN_N, SLICE_CV, SLICE_SPAN, WIN_S = 5000, 8, 0.35, 60, 600
@@ -252,6 +254,10 @@ class Whales:
         self.vol = collections.defaultdict(float)
         self.st = collections.defaultdict(lambda: dict(bought=0.0, sold=0.0, tk=0.0, mk=0.0))
         self.big = {"buy": 0.0, "sell": 0.0}
+        self.recent = collections.defaultdict(collections.deque)
+        self.alerted = {}
+        self.pending = []
+        self.last_slow = 0.0
         self.lock = threading.Lock()
 
     def on_msg(self, raw):
@@ -272,6 +278,14 @@ class Whales:
                     taker = buyer if buy_agg else seller
                     self.flow[taker] += usd if buy_agg else -usd
                     self.vol[taker] += usd
+                    dq = self.recent[taker]
+                    dq.append((ts, usd if buy_agg else -usd))
+                    while dq and dq[0][0] < ts - BURST_WIN:
+                        dq.popleft()
+                    net = sum(x for _, x in dq)
+                    if abs(net) >= BURST_USD and ts - self.alerted.get(taker, 0) > BURST_COOL:
+                        self.alerted[taker] = ts
+                        self.pending.append((taker, net, ts))
                     self.st[buyer]["bought"] += usd
                     self.st[seller]["sold"] += usd
                     self.st[taker]["tk"] += 1
@@ -311,6 +325,25 @@ class Whales:
         put(self.con, ts, "hyperliquid", "trend_sell_usd", ts_)
         put(self.con, ts, "hyperliquid", "mm_bots", mm)
 
+    def flush_bursts(self):
+        with self.lock:
+            items, self.pending = self.pending, []
+        for addr, net, ts in items:
+            side = "BULL" if net > 0 else "BEAR"
+            put_event(self.con, ts, "hyperliquid", "BURST", side, abs(net), 0,
+                      "wallet %s..%s ne 1 min me $%.2fM %s" % (addr[:6], addr[-4:], abs(net) / 1e6, "kharida" if net > 0 else "becha"))
+            try:
+                st = self.H("POST", HL, json={"type": "clearinghouseState", "user": addr})
+                for ap in st.get("assetPositions", []):
+                    p = ap["position"]
+                    if p["coin"] == "BTC":
+                        with LOCK:
+                            self.con.execute("INSERT INTO w VALUES(?,?,?,?,?,?,?,?,?)",
+                                             (int(ts), addr, f(p["szi"]), f(p["entryPx"]), f(p.get("liquidationPx")),
+                                              f(p["unrealizedPnl"]), f((p.get("leverage") or {}).get("value")), f(p["positionValue"]), net))
+            except Exception as e:
+                print("burst poll err", e)
+
     def poll_state(self, ts):
         with self.lock:
             top = sorted(self.vol.items(), key=lambda kv: -kv[1])[:TOP_N]
@@ -339,6 +372,10 @@ class Whales:
         put(self.con, ts, "hyperliquid", "whale_long_usd", longs)
         put(self.con, ts, "hyperliquid", "whale_short_usd", shorts)
         put(self.con, ts, "hyperliquid", "whale_n", float(len(top)))
+        if time.time() - self.last_slow < SLOW_EVERY:
+            self.con.commit()
+            return
+        self.last_slow = time.time()
         self.classify_all(ts)
         with self.lock:
             for d in (self.flow, self.vol):
@@ -405,7 +442,7 @@ def bias_calc(con, now):
         parts.append("HL trend wallets %+.1f" % x)
     rows = con.execute("SELECT kind,side,COUNT(*) FROM e WHERE ts>? GROUP BY kind,side", (int(now) - 900,)).fetchall()
     cnt = {(k, s): n for k, s, n in rows}
-    for kind, w in (("SLICE", 0.5), ("ABSORB", 1.0)):
+    for kind, w in (("SLICE", 0.5), ("ABSORB", 1.0), ("BURST", 0.5)):
         x = clamp(w * (cnt.get((kind, "BULL"), 0) - cnt.get((kind, "BEAR"), 0)), 3)
         if x:
             sc += x
@@ -422,6 +459,56 @@ def bias_calc(con, now):
         parts.append("top-vs-retail %+.1f" % x)
     label = "BULLISH" if sc >= 2 else "BEARISH" if sc <= -2 else "NEUTRAL"
     return sc, label, parts
+
+
+# ------------- paisa flow synthesis (price + OI milake) -------------
+OI_FIELD = {"binance": "oi_btc", "bybit": "oi_btc", "okx": "oi_btc", "delta": "oi"}
+FLOW_WIN = 900   # 15 min
+
+
+def flow_label(con, src, now):
+    kf = OI_FIELD.get(src)
+    if not kf:
+        return None
+    pr = con.execute("SELECT ts,v FROM m WHERE src=? AND k='mark' AND ts>? ORDER BY ts", (src, now - FLOW_WIN)).fetchall()
+    oi = con.execute("SELECT ts,v FROM m WHERE src=? AND k=? AND ts>? ORDER BY ts", (src, kf, now - FLOW_WIN)).fetchall()
+    if len(pr) < 2 or len(oi) < 2:
+        return None
+    dp = pr[-1][1] - pr[0][1]
+    doi = oi[-1][1] - oi[0][1]
+    doi_pct = doi / oi[0][1] * 100 if oi[0][1] else 0
+    if abs(doi_pct) < 0.05:   # itna chhota OI change -> shor, kuch mat bolo
+        return None
+    if dp >= 0 and doi > 0:
+        return ("GHUS", "long", dp, doi_pct)
+    if dp < 0 and doi > 0:
+        return ("GHUS", "short", dp, doi_pct)
+    if dp >= 0 and doi < 0:
+        return ("NIKAL", "short-covering", dp, doi_pct)
+    return ("NIKAL", "long-unwind", dp, doi_pct)
+
+
+def synthesize(con, now):
+    labels = {}
+    for src in ("binance", "bybit", "okx"):
+        r = flow_label(con, src, now)
+        if r:
+            labels[src] = r
+    if not labels:
+        return "15 min me OI itna kam badla ki kuch kehna shor hoga. Chup rehna behtar hai."
+    ghus = [s for s, r in labels.items() if r[0] == "GHUS"]
+    nikal = [s for s, r in labels.items() if r[0] == "NIKAL"]
+    parts = []
+    for s, (flow, kind, dp, doi_pct) in labels.items():
+        parts.append("%s: %s (%s, price %+.0f, OI %+.2f%%)" % (s, flow, kind, dp, doi_pct))
+    detail = " | ".join(parts)
+    if len(ghus) > len(nikal):
+        head = "PAISA MARKET ME GHUS RAHA HAI (naya position ban raha hai, %d/%d venue)" % (len(ghus), len(labels))
+    elif len(nikal) > len(ghus):
+        head = "PAISA MARKET SE NIKAL RAHA HAI (log position band kar rahe hain, %d/%d venue)" % (len(nikal), len(labels))
+    else:
+        head = "VENUE AAPAS ME ULTE HAIN, saaf tasveer nahi (confused signal)"
+    return head + "\n   " + detail + "\n   (ye heuristic hai, price-OI se seedha nikla, asli test nahi hua)"
 
 
 # ------------- main loop / report -------------
@@ -475,6 +562,8 @@ def report(con):
     sc, label, parts = bias_calc(con, now)
     print("\n=== FOOTPRINT BIAS: %s (score %+.1f, confidence LOW, weights untested) ===" % (label, sc))
     print("   " + (", ".join(parts) if parts else "koi footprint nahi mila"))
+    print("\n--- PAISA FLOW (15 min, price+OI) ---")
+    print(synthesize(con, now))
     ev = con.execute("SELECT ts,venue,kind,side,note FROM e WHERE ts>? ORDER BY ts DESC LIMIT 10", (int(now) - 1800,)).fetchall()
     if ev:
         print("\nPichhle 30 min ke events:")
@@ -503,18 +592,27 @@ def run():
         except Exception as e:
             print("thread start fail", e)
     last_state = 0
+    last_bias_alert = [0.0]
     print("collector chalu. DB=%s (Ctrl+C band)" % DB)
+    if TG_TOKEN and TG_CHAT:
+        tg_send("Collector chalu ho gaya, bhai. BURST/ABSORB events yahan aayenge.")
+    else:
+        print("TG_TOKEN/TG_CHAT set nahi, Telegram alerts OFF")
     while True:
         t0 = time.time()
         ts = snapshot(con)
         wh.flush_big(ts)
+        wh.flush_bursts()
         tape_hl.scan(time.time())
         tape_bn.scan(time.time())
         if time.time() - last_state > STATE_EVERY:
             wh.poll_state(ts)
             last_state = time.time()
-        sc, label, _ = bias_calc(con, time.time())
+        sc, label, parts = bias_calc(con, time.time())
         put(con, ts, "footprint", "bias_score", sc)
+        if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
+            last_bias_alert[0] = time.time()
+            tg_send("FOOTPRINT BIAS: %s (score %+.1f)\n%s\n(confidence LOW, weights untested)" % (label, sc, ", ".join(parts) if parts else "-"))
         con.commit()
         time.sleep(max(1, EVERY - (time.time() - t0)))
 
@@ -617,6 +715,18 @@ def selftest():
     print("4) wallet labels:", labs)
     assert labs.get("0xMM") == "MM-BOT" and labs.get("0xTREND") == "TREND-BUY"
 
+    wb = Whales(con, fake)
+    for i in range(10):
+        wb.on_msg({"channel": "trades", "data": [{"coin": "BTC", "side": "B", "px": "81500", "sz": "1.0", "time": (t0 + i) * 1000,
+                                                   "users": ["0xBURST", "0xM%d" % i]}]})
+    wb.flush_bursts()
+    r = con.execute("SELECT kind,side,note FROM e WHERE kind='BURST'").fetchall()
+    print("4b) burst test:", r)
+    assert len(r) == 1 and r[0][1] == "BULL"
+    wb.on_msg({"channel": "trades", "data": [{"coin": "BTC", "side": "B", "px": "81500", "sz": "1.0", "time": (t0 + 20) * 1000, "users": ["0xBURST", "0xMZ"]}]})
+    wb.flush_bursts()
+    assert con.execute("SELECT COUNT(*) FROM e WHERE kind='BURST'").fetchone()[0] == 1, "cooldown fail"
+    print("4c) cooldown ok")
     sc, label, parts = bias_calc(con, t0 + 400)
     print("5) bias:", label, round(sc, 1), parts)
     print("\n----- report (nakli) -----")
