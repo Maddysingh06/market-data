@@ -197,8 +197,30 @@ def c_gmx(H):
     return o
 
 
+def c_depth(H):
+    # Binance futures order-book -- same base URL (fapi.binance.com) jo already kaam kar raha hai,
+    # isliye is endpoint pe mujhe zyada bharosa hai (Binance ka sabse purana/stable public endpoint hai).
+    # Public data hai -- "kis price pe kitna buy/sell order khada hai", koi wallet/account info nahi.
+    r = H("GET", "https://fapi.binance.com/fapi/v1/depth", params={"symbol": "BTCUSDT", "limit": 500})
+    bids = [(f(p), f(q)) for p, q in r.get("bids", [])]
+    asks = [(f(p), f(q)) for p, q in r.get("asks", [])]
+    bids = [(p, q) for p, q in bids if p is not None and q is not None]
+    asks = [(p, q) for p, q in asks if p is not None and q is not None]
+    bid_usd = sum(p * q for p, q in bids)
+    ask_usd = sum(p * q for p, q in asks)
+    o = {"bid_usd": bid_usd, "ask_usd": ask_usd}
+    if bids:
+        bw = max(bids, key=lambda x: x[0] * x[1])
+        o["bid_wall_px"], o["bid_wall_usd"] = bw[0], bw[0] * bw[1]
+    if asks:
+        aw = max(asks, key=lambda x: x[0] * x[1])
+        o["ask_wall_px"], o["ask_wall_usd"] = aw[0], aw[0] * aw[1]
+    return o
+
+
 SRC = {"binance": c_binance, "bybit": c_bybit, "okx": c_okx, "hyperliquid": c_hyper,
-       "coinbase": c_coinbase, "deribit": c_deribit, "delta": c_delta, "dydx": c_dydx, "gmx": c_gmx}
+       "coinbase": c_coinbase, "deribit": c_deribit, "delta": c_delta, "dydx": c_dydx, "gmx": c_gmx,
+       "depth": c_depth}
 
 
 # ------------- DB -------------
@@ -582,6 +604,12 @@ def bias_calc(con, now):
         if abs(x) > 0.1:
             sc += x
             parts.append("GMX OI %+.1f" % x)
+    bu, au = g("depth", "bid_usd"), g("depth", "ask_usd")
+    if bu is not None and au is not None and (bu + au) > 0:
+        x = clamp((bu - au) / 10e6, 0.5)   # kam weight -- order book bahut jaldi badalta hai, noisy hai
+        if abs(x) > 0.1:
+            sc += x
+            parts.append("order-book imbalance %+.1f" % x)
     label = "BULLISH" if sc >= 2 else "BEARISH" if sc <= -2 else "NEUTRAL"
     return sc, label, parts
 
@@ -773,6 +801,36 @@ def entry_radar(con, now):
     return out
 
 
+def wall_watch(con, now):
+    """Order-book ke 2 sabse hal ke snapshots compare karta hai -- agar koi bada wall (bid ya ask)
+    pehle se wahan tha aur ab bahut chhota ho gaya/gayab ho gaya hai, matlab 'khaaya ja chuka' ho sakta hai
+    (absorb khatam, ab price move kar sakta hai). Agar wall abhi bhi khada hai, absorb jaari hai."""
+    rows = con.execute(
+        "SELECT ts,k,v FROM m WHERE src='depth' AND k IN "
+        "('bid_wall_px','bid_wall_usd','ask_wall_px','ask_wall_usd') AND ts>? ORDER BY ts",
+        (int(now) - 1800,)).fetchall()
+    by_ts = collections.defaultdict(dict)
+    for ts, k, v in rows:
+        by_ts[ts][k] = v
+    stamps = sorted(by_ts)
+    if len(stamps) < 2:
+        return None
+    first, last = by_ts[stamps[0]], by_ts[stamps[-1]]
+    out = {}
+    for side in ("bid", "ask"):
+        px0, u0 = first.get(side + "_wall_px"), first.get(side + "_wall_usd")
+        px1, u1 = last.get(side + "_wall_px"), last.get(side + "_wall_usd")
+        if u0 and u1 and px0 and px1:
+            same_level = abs(px1 - px0) / px0 < 0.002   # ~same price level
+            if same_level and u1 < u0 * 0.5:
+                out[side] = ("EATEN/CHHOTA HO GAYA", px1, u0, u1)
+            elif same_level:
+                out[side] = ("ABHI BHI KHADA HAI", px1, u0, u1)
+            else:
+                out[side] = ("WALL KHISAK GAYA (naya price pe)", px1, u0, u1)
+    return out or None
+
+
 SETUP_MIN_WALLETS = 3
 SETUP_MAJORITY = 0.6     # 60% ya zyada wallets ek disha me ho
 SETUP_COOLDOWN = 900     # ek disha me dubara log karne se pehle 15 min ruko
@@ -925,6 +983,7 @@ def print_trade_plan(con, now):
 
 
 def report(con):
+    now = time.time()
     L = latest(con)
     if not L:
         print("abhi data nahi. pehle collector chalao.")
@@ -955,10 +1014,24 @@ def report(con):
     db_, ds_ = g("dydx", "recent_buy_usd"), g("dydx", "recent_sell_usd")
     if db_ is not None and ds_ is not None and (db_ + ds_) > 0:
         print("dYdX (on-chain) recent trades: buy $%.0f / sell $%.0f" % (db_, ds_))
+    bw_px, bw_usd = g("depth", "bid_wall_px"), g("depth", "bid_wall_usd")
+    aw_px, aw_usd = g("depth", "ask_wall_px"), g("depth", "ask_wall_usd")
+    if bw_px or aw_px:
+        print("\n--- ORDER BOOK WALLS (Binance, public, 'bada chhupa order kahan khada hai') ---")
+        if bw_px:
+            print("   BID wall: $%.0f pe $%.2fM khada hai (niche support)" % (bw_px, bw_usd / 1e6))
+        if aw_px:
+            print("   ASK wall: $%.0f pe $%.2fM khada hai (upar resistance)" % (aw_px, aw_usd / 1e6))
+        ww = wall_watch(con, now)
+        if ww:
+            for side, (status, px, u0, u1) in ww.items():
+                print("   %s wall (30 min pehle vs ab): %s -- $%.0f pe tha $%.2fM, ab $%.2fM" %
+                      (side.upper(), status, px, u0 / 1e6, u1 / 1e6))
+        else:
+            print("   (wall history ke liye abhi kam data hai, thodi der baad compare hoga)")
     pc = g("deribit", "put_call_oi")
     if pc:
         print("Deribit put/call OI: %.2f" % pc)
-    now = time.time()
     sc, label, parts = bias_calc(con, now)
     print("\n=== FOOTPRINT BIAS: %s (score %+.1f, confidence LOW, weights untested) ===" % (label, sc))
     print("   " + (", ".join(parts) if parts else "koi footprint nahi mila"))

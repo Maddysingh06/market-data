@@ -50,8 +50,41 @@ def bias_calc(con, now):
         x = 0.5 if tp > rl else -0.5
         sc += x
         parts.append("top-vs-retail %+.1f" % x)
+    bu, au = g("depth", "bid_usd"), g("depth", "ask_usd")
+    if bu is not None and au is not None and (bu + au) > 0:
+        x = max(-0.5, min(0.5, (bu - au) / 10e6))
+        if abs(x) > 0.1:
+            sc += x
+            parts.append("order-book imbalance %+.1f" % x)
     label = "BULLISH" if sc >= 2 else "BEARISH" if sc <= -2 else "NEUTRAL"
     return sc, label, parts
+
+
+def wall_watch(con, now):
+    rows = con.execute(
+        "SELECT ts,k,v FROM m WHERE src='depth' AND k IN "
+        "('bid_wall_px','bid_wall_usd','ask_wall_px','ask_wall_usd') AND ts>? ORDER BY ts",
+        (int(now) - 1800,)).fetchall()
+    by_ts = collections.defaultdict(dict)
+    for ts, k, v in rows:
+        by_ts[ts][k] = v
+    stamps = sorted(by_ts)
+    if len(stamps) < 2:
+        return None
+    first, last = by_ts[stamps[0]], by_ts[stamps[-1]]
+    out = {}
+    for side in ("bid", "ask"):
+        px0, u0 = first.get(side + "_wall_px"), first.get(side + "_wall_usd")
+        px1, u1 = last.get(side + "_wall_px"), last.get(side + "_wall_usd")
+        if u0 and u1 and px0 and px1:
+            same_level = abs(px1 - px0) / px0 < 0.002
+            if same_level and u1 < u0 * 0.5:
+                out[side] = ("EATEN/CHHOTA HO GAYA", px1, u0, u1)
+            elif same_level:
+                out[side] = ("ABHI BHI KHADA HAI", px1, u0, u1)
+            else:
+                out[side] = ("KHISAK GAYA", px1, u0, u1)
+    return out or None
 
 
 def esc(s):
@@ -339,6 +372,25 @@ def render():
             "<div class='small'>BUY $%.1fM (%.0f%%) &nbsp;vs&nbsp; SELL $%.1fM (%.0f%%)</div>"
             "<div style='font-weight:700;color:%s;margin-top:2px'>%s</div>"
             "</div>" % (pct, 100 - pct, buy / 1e6, pct, sell / 1e6, 100 - pct, hcol, heavier))
+
+    L2 = latest(con)
+    g2 = lambda s, k: (L2[(s, k)][0] if (s, k) in L2 else None)
+    bw_px, bw_usd = g2("depth", "bid_wall_px"), g2("depth", "bid_wall_usd")
+    aw_px, aw_usd = g2("depth", "ask_wall_px"), g2("depth", "ask_wall_usd")
+    if bw_px or aw_px:
+        lines = ["<div class='hdr'>ORDER BOOK WALLS (Binance, public -- chhupa bada order kahan khada hai)</div>"]
+        if bw_px:
+            lines.append("<div class='small' style='color:#4ade80'>BID wall: $%.0f pe $%.2fM (niche support)</div>" % (bw_px, bw_usd / 1e6))
+        if aw_px:
+            lines.append("<div class='small' style='color:#f87171'>ASK wall: $%.0f pe $%.2fM (upar resistance)</div>" % (aw_px, aw_usd / 1e6))
+        ww = wall_watch(con, now)
+        if ww:
+            for side, (status, px, u0, u1) in ww.items():
+                lines.append("<div class='small' style='margin-top:2px'>%s wall (30 min me): <b>%s</b> -- tha $%.2fM, ab $%.2fM</div>" %
+                             (side.upper(), status, u0 / 1e6, u1 / 1e6))
+        else:
+            lines.append("<div class='small' style='color:#666'>(history ke liye abhi kam data hai)</div>")
+        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     ps = plain_setup(con, now)
     confcol = {"zyada": "#1b7a3a", "medium": "#8a6d1b", "halki": "#555", "sirf-bias": "#555"}
