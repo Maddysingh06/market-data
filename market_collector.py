@@ -148,8 +148,57 @@ def c_delta(H):
     return {"mark": f(r.get("mark_price")), "funding": f(r.get("funding_rate")), "oi": f(r.get("oi"))}
 
 
+def c_dydx(H):
+    # dYdX v4 -- isliye jodh raha hu kyunki Hyperliquid jaisa hi ON-CHAIN hai, isliye range badhti hai.
+    # SACH: ye endpoint maine verify nahi kiya real response ke against -- pehli baar chalega tere server pe.
+    # ERR aaye to paste kar dena, exact field name theek kar dunga.
+    B = "https://indexer.dydx.trade/v4"
+    o = {}
+    d = H("GET", B + "/perpetualMarkets", params={"ticker": "BTC-USD"})
+    m = (d.get("markets") or {}).get("BTC-USD", {})
+    o["mark"] = f(m.get("oraclePrice"))
+    o["funding"] = f(m.get("nextFundingRate"))
+    o["oi_btc"] = f(m.get("openInterest"))
+    try:
+        tr = H("GET", B + "/trades/perpetualMarket/BTC-USD", params={"limit": 100})
+        trades = tr.get("trades", [])
+        buy = sum((f(t.get("size")) or 0) * (f(t.get("price")) or 0) for t in trades if t.get("side") == "BUY")
+        sell = sum((f(t.get("size")) or 0) * (f(t.get("price")) or 0) for t in trades if t.get("side") == "SELL")
+        o["recent_buy_usd"], o["recent_sell_usd"] = buy, sell
+    except Exception:
+        pass
+    return o
+
+
+def c_gmx(H):
+    # GMX v2 (Arbitrum, on-chain perp DEX). SACH: endpoint/field-names maine verify nahi kiye real
+    # response ke against -- pehli baar tere server pe chalega. ERR aaye to raw output paste karna.
+    # Abhi sirf AGGREGATE (total long vs short $ ) le raha hu, wallet-level NAHI -- Hyperliquid ke
+    # wallet-tracking table (w/c) ka schema alag hai, usme GMX wallets mix karna galat/confusing hota
+    # (dono EVM-style addresses dikhte same hain), isliye jaan-bujh kar alag rakha.
+    B = "https://gmx-api-arbitrum-2nlbk.ondigitalocean.app/api/v1"
+    o = {}
+    d = H("GET", B + "/positions")
+    rows = d if isinstance(d, list) else (d.get("positions") or d.get("data") or [])
+    long_usd = short_usd = 0.0
+    for p in rows:
+        mkt = str(p.get("market") or p.get("marketName") or p.get("indexToken") or "")
+        if "BTC" not in mkt.upper():
+            continue
+        size = f(p.get("sizeInUsd") or p.get("sizeUsd") or p.get("size") or 0) or 0
+        is_long = p.get("isLong")
+        if is_long is None:
+            is_long = str(p.get("side", "")).upper() == "LONG"
+        if is_long:
+            long_usd += size
+        else:
+            short_usd += size
+    o["long_usd"], o["short_usd"] = long_usd, short_usd
+    return o
+
+
 SRC = {"binance": c_binance, "bybit": c_bybit, "okx": c_okx, "hyperliquid": c_hyper,
-       "coinbase": c_coinbase, "deribit": c_deribit, "delta": c_delta}
+       "coinbase": c_coinbase, "deribit": c_deribit, "delta": c_delta, "dydx": c_dydx, "gmx": c_gmx}
 
 
 # ------------- DB -------------
@@ -160,10 +209,15 @@ def db():
     con.execute("CREATE TABLE IF NOT EXISTS e(ts INT, venue TEXT, kind TEXT, side TEXT, a REAL, b REAL, note TEXT)")
     con.execute("CREATE TABLE IF NOT EXISTS c(ts INT, addr TEXT, label TEXT, bought REAL, sold REAL, maker_n REAL, taker_n REAL, n REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS setups(ts INT, direction TEXT, entry REAL, n_wallets INT, net_score REAL, "
-                "eval15 TEXT, px15 REAL, eval30 TEXT, px30 REAL, eval60 TEXT, px60 REAL)")
+                "eval15 TEXT, px15 REAL, eval30 TEXT, px30 REAL, eval60 TEXT, px60 REAL, eval240 TEXT, px240 REAL)")
     con.execute("CREATE INDEX IF NOT EXISTS im ON m(src,k,ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ie ON e(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS is_ ON setups(ts)")
+    for stmt in ("ALTER TABLE setups ADD COLUMN eval240 TEXT", "ALTER TABLE setups ADD COLUMN px240 REAL"):
+        try:
+            con.execute(stmt)
+        except sqlite3.OperationalError:
+            pass   # purani DB me pehle se column ho sakta hai, ya naya DB me CREATE ne pehle hi daal diya
     return con
 
 
@@ -263,18 +317,22 @@ class Tape:
 
 
 # ------------- FOOTPRINT 2: Hyperliquid wallets -------------
-def classify(s):
+PIG_MIN_N, PIG_MM_N, PIG_TREND_USD = 10, 15, 20_000   # chhote players ke liye halke thresholds (meri guess)
+WHALE_TREND_USD = 2_000_000
+
+
+def classify(s, min_n=MIN_N, mm_n=50, trend_usd=WHALE_TREND_USD):
     tot = s["bought"] + s["sold"]
     n = s["tk"] + s["mk"]
-    if n < MIN_N or tot <= 0:
+    if n < min_n or tot <= 0:
         return None
     d = (s["bought"] - s["sold"]) / tot
     mkr = s["mk"] / n
-    if mkr >= 0.7 and abs(d) < 0.25 and n >= 50:
+    if mkr >= 0.7 and abs(d) < 0.25 and n >= mm_n:
         return "MM-BOT"
-    if tot >= 2_000_000 and abs(d) >= 0.6 and mkr < 0.5:
+    if tot >= trend_usd and abs(d) >= 0.6 and mkr < 0.5:
         return "TREND-BUY" if d > 0 else "TREND-SELL"
-    if tot >= 2_000_000 and abs(d) < 0.25 and mkr < 0.5:
+    if tot >= trend_usd and abs(d) < 0.25 and mkr < 0.5:
         return "SCALP-ARB"
     return None
 
@@ -334,19 +392,37 @@ class Whales:
 
     def classify_all(self, ts):
         tb = ts_ = mm = 0.0
+        pig_tb = pig_ts = pig_mm = 0.0
         rows = []
         with self.lock:
             for a, s in list(self.st.items()):
                 lab = classify(s)
-                if lab:
-                    rows.append((int(ts), a, lab, s["bought"], s["sold"], s["mk"], s["tk"], s["mk"] + s["tk"]))
+                tier_lab = lab
+                pig = False
+                if not lab:
+                    lab2 = classify(s, min_n=PIG_MIN_N, mm_n=PIG_MM_N, trend_usd=PIG_TREND_USD)
+                    if lab2 and (s["bought"] + s["sold"]) < WHALE_TREND_USD:   # itna bada ho gaya to ab whale hi hai
+                        tier_lab = "PIG-" + lab2
+                        pig = True
+                if tier_lab:
+                    rows.append((int(ts), a, tier_lab, s["bought"], s["sold"], s["mk"], s["tk"], s["mk"] + s["tk"]))
                     net = s["bought"] - s["sold"]
-                    if lab == "TREND-BUY":
-                        tb += net
-                    elif lab == "TREND-SELL":
-                        ts_ += -net
-                    elif lab == "MM-BOT":
-                        mm += 1
+                    base = tier_lab[4:] if pig else tier_lab
+                    if base == "TREND-BUY":
+                        if pig:
+                            pig_tb += net
+                        else:
+                            tb += net
+                    elif base == "TREND-SELL":
+                        if pig:
+                            pig_ts += -net
+                        else:
+                            ts_ += -net
+                    elif base == "MM-BOT":
+                        if pig:
+                            pig_mm += 1
+                        else:
+                            mm += 1
                 for k in s:
                     s[k] *= 0.92
                 if s["bought"] + s["sold"] < 10_000:
@@ -355,6 +431,9 @@ class Whales:
             self.con.executemany("INSERT INTO c VALUES(?,?,?,?,?,?,?,?)", rows)
         put(self.con, ts, "hyperliquid", "trend_buy_usd", tb)
         put(self.con, ts, "hyperliquid", "trend_sell_usd", ts_)
+        put(self.con, ts, "hyperliquid", "pig_trend_buy_usd", pig_tb)
+        put(self.con, ts, "hyperliquid", "pig_trend_sell_usd", pig_ts)
+        put(self.con, ts, "hyperliquid", "pig_mm_bots", pig_mm)
         put(self.con, ts, "hyperliquid", "mm_bots", mm)
 
     def flush_bursts(self):
@@ -491,6 +570,18 @@ def bias_calc(con, now):
         x = 0.5 if tp > rl else -0.5
         sc += x
         parts.append("top-vs-retail %+.1f" % x)
+    db_, ds_ = g("dydx", "recent_buy_usd"), g("dydx", "recent_sell_usd")
+    if db_ is not None and ds_ is not None and (db_ + ds_) > 0:
+        x = clamp((db_ - ds_) / 2e6, 1)
+        if abs(x) > 0.1:
+            sc += x
+            parts.append("dYdX flow %+.1f" % x)
+    gl, gs = g("gmx", "long_usd"), g("gmx", "short_usd")
+    if gl is not None and gs is not None and (gl + gs) > 0:
+        x = clamp((gl - gs) / 5e6, 1)
+        if abs(x) > 0.1:
+            sc += x
+            parts.append("GMX OI %+.1f" % x)
     label = "BULLISH" if sc >= 2 else "BEARISH" if sc <= -2 else "NEUTRAL"
     return sc, label, parts
 
@@ -618,6 +709,24 @@ def distinct_actors(con, now, window=1800):
     return addrs
 
 
+def tier_name(usd):
+    # Ye MERI guess hai ($ size se), teacher ke Pig/Deer/Shark... POINTS-move class se ALAG cheez hai
+    if usd is None:
+        return "?"
+    u = abs(usd)
+    if u < 100_000:
+        return "PIG"
+    if u < 300_000:
+        return "DEER"
+    if u < 1_000_000:
+        return "SHARK"
+    if u < 5_000_000:
+        return "WHALE"
+    if u < 20_000_000:
+        return "BLUEWHALE"
+    return "BIGDADDY"
+
+
 def whale_conviction(con, now):
     w = con.execute("SELECT addr, szi, usd, MAX(ts) FROM w GROUP BY addr").fetchall()
     c = con.execute("SELECT addr, label, MAX(ts) FROM c GROUP BY addr").fetchall()
@@ -637,7 +746,30 @@ def whale_conviction(con, now):
             verdict, sign = "PRESSING SHORT (aur bada rahah hai)", -1
         else:
             verdict, sign = "SHORT KAM KAR RAHA (covering/exit)", 1
-        out.append((addr, "LONG" if pos_long else "SHORT", usd, verdict, sign))
+        out.append((addr, "LONG" if pos_long else "SHORT", usd, verdict, sign, tier_name(usd)))
+    return out
+
+
+def entry_radar(con, now):
+    """Har tier (Pig..BigDaddy) me abhi 'entry forming' (buy ya sell flow banta) dikh raha hai kya -- size se bucket, flow se direction."""
+    rows = con.execute("SELECT addr,label,bought,sold FROM c WHERE ts=(SELECT MAX(ts) FROM c)").fetchall()
+    tiers = collections.defaultdict(lambda: {"buy": 0.0, "sell": 0.0, "n": 0})
+    for addr, lab, b_, s_ in rows:
+        base = lab[4:] if lab.startswith("PIG-") else lab
+        if base not in ("TREND-BUY", "TREND-SELL"):
+            continue
+        tot = (b_ or 0) + (s_ or 0)
+        t = tiers[tier_name(tot)]
+        t["buy"] += b_ or 0
+        t["sell"] += s_ or 0
+        t["n"] += 1
+    order = ["PIG", "DEER", "SHARK", "WHALE", "BLUEWHALE", "BIGDADDY"]
+    out = []
+    for name in order:
+        if name in tiers:
+            t = tiers[name]
+            net = t["buy"] - t["sell"]
+            out.append((name, t["n"], net, t["buy"], t["sell"]))
     return out
 
 
@@ -681,23 +813,24 @@ def evaluate_setups(con, now):
     px = current_mark(con)
     if px is None:
         return
-    for col_eval, col_px, win in (("eval15", "px15", 900), ("eval30", "px30", 1800), ("eval60", "px60", 3600)):
+    for col_eval, col_px, win, thresh in (("eval15", "px15", 900, TRACK_MOVE), ("eval30", "px30", 1800, TRACK_MOVE),
+                                          ("eval60", "px60", 3600, TRACK_MOVE), ("eval240", "px240", 14400, TRACK_MOVE * 3)):
         rows = con.execute("SELECT rowid,direction,entry FROM setups WHERE %s IS NULL AND ts<=?" % col_eval,
                            (int(now) - win,)).fetchall()
         for rowid, direction, entry in rows:
             move = px - entry
             if direction == "BULL":
-                verdict = "HIT" if move > TRACK_MOVE else "MISS" if move < -TRACK_MOVE else "FLAT"
+                verdict = "HIT" if move > thresh else "MISS" if move < -thresh else "FLAT"
             else:
-                verdict = "HIT" if move < -TRACK_MOVE else "MISS" if move > TRACK_MOVE else "FLAT"
+                verdict = "HIT" if move < -thresh else "MISS" if move > thresh else "FLAT"
             with LOCK:
                 con.execute("UPDATE setups SET %s=?, %s=? WHERE rowid=?" % (col_eval, col_px), (verdict, px, rowid))
 
 
 def track_record(con):
-    rows = con.execute("SELECT eval15,eval30,eval60 FROM setups").fetchall()
+    rows = con.execute("SELECT eval15,eval30,eval60,eval240 FROM setups").fetchall()
     out = {}
-    for i, col in enumerate(("15min", "30min", "60min")):
+    for i, col in enumerate(("15min", "30min", "60min", "4hr")):
         vals = [r[i] for r in rows if r[i] is not None]
         h, m, f = vals.count("HIT"), vals.count("MISS"), vals.count("FLAT")
         out[col] = (h, m, f, len(vals))
@@ -718,6 +851,79 @@ def print_sr(con, now):
               (zone, tot, st["up"], st["up"] / tot * 100, st["down"], st["down"] / tot * 100, st["flat"]))
 
 
+def trade_plan(con, now):
+    """Apna khud ka heuristic: bias + SR zones + volatility se Entry/SL/TP aur wick/reversal zones nikalta hai.
+    Ye KOI proven strategy nahi hai -- sirf humara apna thin data hai. track_record() hi bata payega ye kaam karta hai ya nahi."""
+    px = current_mark(con)
+    if px is None:
+        return None
+    sc, label, _ = bias_calc(con, now)
+    near, npoints = sr_zones(con, now)
+    direction = "LONG" if sc > 0.5 else "SHORT" if sc < -0.5 else None
+
+    rows = con.execute("SELECT v FROM m WHERE src='binance' AND k='mark' AND ts>?", (now - 3600,)).fetchall()
+    vol = None
+    if len(rows) > 10:
+        vals = [r[0] for r in rows]
+        mean = sum(vals) / len(vals)
+        var = sum((x - mean) ** 2 for x in vals) / len(vals)
+        vol = var ** 0.5
+    sl_fallback = max((vol or 0) * 1.5, 150)
+    tp_fallback = sl_fallback * 2
+
+    reliable = [(z, st) for z, st in (near or []) if st["touch"] >= 5]
+    support = resistance = None
+    for z, st in reliable:
+        if z < px and st["up"] / st["touch"] >= 0.5:
+            if support is None or z > support[0]:
+                support = (z, st)
+        if z > px and st["down"] / st["touch"] >= 0.5:
+            if resistance is None or z < resistance[0]:
+                resistance = (z, st)
+
+    wick_zones = [(z, st) for z, st in (near or []) if st["touch"] >= 5 and max(st["up"], st["down"]) / st["touch"] >= 0.5]
+
+    plan = {"price": px, "direction": direction, "bias_score": sc, "bias_label": label,
+            "reliable_zones": len(reliable), "wick_zones": wick_zones}
+    if direction == "LONG":
+        plan["entry"] = px
+        plan["sl"] = support[0] - 20 if support else px - sl_fallback
+        plan["tp"] = resistance[0] - 20 if resistance else px + tp_fallback
+    elif direction == "SHORT":
+        plan["entry"] = px
+        plan["sl"] = resistance[0] + 20 if resistance else px + sl_fallback
+        plan["tp"] = support[0] + 20 if support else px - tp_fallback
+    else:
+        plan["entry"] = plan["sl"] = plan["tp"] = None
+    if plan["entry"] is not None:
+        plan["sl_pts"] = abs(plan["entry"] - plan["sl"])
+        plan["tp_pts"] = abs(plan["entry"] - plan["tp"])
+    return plan
+
+
+def print_trade_plan(con, now):
+    plan = trade_plan(con, now)
+    print("\n--- TRADE PLAN (DRAFT, khud-banaya heuristic, BACKTESTED NAHI -- ye koi proven strategy nahi hai) ---")
+    if not plan:
+        return
+    if plan["direction"] is None:
+        print("   Bias abhi neutral/weak (score %+.1f) hai -- koi clean entry plan nahi banaya. Jab bias clear hoga tab banega." % plan["bias_score"])
+        return
+    print("   Bias: %s (score %+.1f) -> suggested %s" % (plan["bias_label"], plan["bias_score"], plan["direction"]))
+    print("   Entry: $%.0f (abhi ka price)" % plan["entry"])
+    print("   SL: $%.0f  (%.0f points)  %s" % (plan["sl"], plan["sl_pts"],
+          "-- SR zone se" if plan["reliable_zones"] else "-- SR data kam hai, sirf volatility-fallback hai"))
+    print("   TP: $%.0f  (%.0f points)" % (plan["tp"], plan["tp_pts"]))
+    if plan["wick_zones"]:
+        print("   WICK/REVERSAL zones (jaha candle ghoomi hai, ab tak ke data se):")
+        for z, st in sorted(plan["wick_zones"], key=lambda kv: abs(kv[0] - plan["price"])):
+            print("      $%.0f : %d touch -> up %.0f%% / down %.0f%% / flat %.0f%%" %
+                  (z, st["touch"], st["up"] / st["touch"] * 100, st["down"] / st["touch"] * 100, st["flat"] / st["touch"] * 100))
+    else:
+        print("   wick zones ke liye abhi reliable data nahi (kam se kam 5 touch chahiye ek zone pe)")
+    print("   SACH: ye sirf humara apna 1-2 din ka data hai, kisi backtest se validate nahi hua. Blindly isse order mat daalo.")
+
+
 def report(con):
     L = latest(con)
     if not L:
@@ -728,7 +934,7 @@ def report(con):
         print("%-12s %-22s %.6g" % (s, k, v))
     g = lambda s, k: L.get((s, k))
     print("\n--- BIAS (sirf ishara, signal nahi) ---")
-    fund = [(s, g(s, "funding")) for s in ("binance", "bybit", "okx", "hyperliquid", "delta") if g(s, "funding") is not None]
+    fund = [(s, g(s, "funding")) for s in ("binance", "bybit", "okx", "hyperliquid", "delta", "dydx") if g(s, "funding") is not None]
     if fund:
         print("Funding:", ", ".join("%s %.4f%%" % (s, v * 100) for s, v in fund))
     cp = g("derived", "coinbase_premium_usd")
@@ -742,6 +948,13 @@ def report(con):
     if wl is not None and ws_ is not None and (wl + ws_) > 0:
         print("HL whales (BTC): long $%.1fM / short $%.1fM -> %s" % (wl / 1e6, ws_ / 1e6,
               "long bhaari" if wl > ws_ * 1.3 else "short bhaari" if ws_ > wl * 1.3 else "balanced"))
+    gl, gs = g("gmx", "long_usd"), g("gmx", "short_usd")
+    if gl is not None and gs is not None and (gl + gs) > 0:
+        print("GMX (Arbitrum, on-chain) BTC: long $%.1fM / short $%.1fM -> %s" % (gl / 1e6, gs / 1e6,
+              "long bhaari" if gl > gs * 1.3 else "short bhaari" if gs > gl * 1.3 else "balanced"))
+    db_, ds_ = g("dydx", "recent_buy_usd"), g("dydx", "recent_sell_usd")
+    if db_ is not None and ds_ is not None and (db_ + ds_) > 0:
+        print("dYdX (on-chain) recent trades: buy $%.0f / sell $%.0f" % (db_, ds_))
     pc = g("deribit", "put_call_oi")
     if pc:
         print("Deribit put/call OI: %.2f" % pc)
@@ -752,14 +965,15 @@ def report(con):
     print("\n--- PAISA FLOW (15 min, price+OI) ---")
     print(synthesize(con, now))
     print_sr(con, now)
+    print_trade_plan(con, now)
 
     print("\n--- WHALE CONVICTION (position + flow milake, dedup) ---")
     conv = whale_conviction(con, now)
     actors = distinct_actors(con, now)
     if conv:
         net = sum(x[4] for x in conv)
-        for addr, side, usd, verdict, sign in conv:
-            print("   %s..%s %s $%.1fM -> %s" % (addr[:6], addr[-4:], side, (usd or 0) / 1e6, verdict))
+        for addr, side, usd, verdict, sign, tier in conv:
+            print("   [%-9s] %s..%s %s $%.1fM -> %s" % (tier, addr[:6], addr[-4:], side, (usd or 0) / 1e6, verdict))
         uniq = len(set(x[0] for x in conv))
         if uniq < 3:
             print("   SAVDHAN: ye sirf %d alag wallet(s) se aa raha hai. 'Market bearish/bullish' mat samjho," % uniq)
@@ -769,6 +983,35 @@ def report(con):
     else:
         print("   abhi koi wallet nahi jiska position + flow dono mile")
     print("   (pichhle 30 min me HL events %d alag wallets se aaye)" % len(actors))
+
+    print("\n--- TIER ENTRY RADAR ($ size se Pig..BigDaddy, MERI apni bucket -- teacher ke point-size class se ALAG) ---")
+    radar = entry_radar(con, now)
+    if radar:
+        for name, n, net, buy, sell in radar:
+            dirn = "GHUS RAHA (buy)" if net > 0 else "NIKAL/SHORT (sell)" if net < 0 else "balanced"
+            print("   %-10s (%d wallets) net %+.0f USD -> %s   [buy $%.0f / sell $%.0f]" % (name, n, net, dirn, buy, sell))
+    else:
+        print("   abhi kisi tier me clean buy/sell flow nahi dikh raha")
+
+    print("\n--- CHHOTE PLAYERS vs WHALE (retail-size flow, halke thresholds, meri guess) ---")
+    ptb, pts_ = g("hyperliquid", "pig_trend_buy_usd"), g("hyperliquid", "pig_trend_sell_usd")
+    wtb, wts_ = g("hyperliquid", "trend_buy_usd"), g("hyperliquid", "trend_sell_usd")
+    if ptb is not None and pts_ is not None:
+        pig_net = ptb - pts_
+        print("   Pig-tier (chhote, $20K-$2M) net flow: %+.0f USD -> %s" %
+              (pig_net, "zyada kharid" if pig_net > 0 else "zyada bikri" if pig_net < 0 else "balanced"))
+        if wtb is not None and wts_ is not None:
+            whale_net = wtb - wts_
+            if whale_net != 0 and pig_net != 0 and (whale_net > 0) != (pig_net > 0):
+                print("   SAVDHAN/INTERESTING: whale (%+.0f) aur chhote players (%+.0f) ULTI disha me hain." % (whale_net, pig_net))
+                print("   Ye proof nahi hai, par dhyan dene layak hai -- kaun sahi nikla, track record se pata chalega.")
+    else:
+        print("   abhi chhote players ka data nahi")
+    pigs = con.execute("SELECT addr,label,bought,sold FROM c WHERE label LIKE 'PIG-%' AND ts=(SELECT MAX(ts) FROM c WHERE label LIKE 'PIG-%') ORDER BY (bought+sold) DESC LIMIT 6").fetchall()
+    if pigs:
+        for a, lab, b_, s_ in pigs:
+            print("   %s..%s %-14s bought $%.0f sold $%.0f" % (a[:6], a[-4:], lab, b_, s_))
+
     tr, total_setups = track_record(con)
     print("\n--- TRACK RECORD (3+ wallet confluence, khud test) ---")
     if total_setups == 0:
