@@ -220,6 +220,63 @@ def current_mark(con, src="binance"):
     return r[0] if r else None
 
 
+def _resample_ohlc(rows, bucket_sec):
+    """rows = [(ts,price), ...] sorted by ts -> {bucket_ts: [o,h,l,c]}"""
+    buckets = {}
+    for ts, px in rows:
+        b = int(ts // bucket_sec) * bucket_sec
+        if b not in buckets:
+            buckets[b] = [px, px, px, px]
+        else:
+            o, h, l, c = buckets[b]
+            buckets[b] = [o, max(h, px), min(l, px), px]
+    return sorted(buckets.items())
+
+
+def _project_line(tA, pA, tB, pB, t_now):
+    if tA == tB:
+        return None
+    t1, p1 = (tA, pA) if tA < tB else (tB, pB)
+    t2, p2 = (tB, pB) if tA < tB else (tA, pA)
+    slope = (p2 - p1) / (t2 - t1)
+    return p1 + slope * (t_now - t1)
+
+
+def trendline_break(con, now, src="binance", big_bucket=3600, small_bucket=300, small_lookback=14400):
+    """Admin/retail log manually jo trendline khinchte hain, uska automated version:
+    1 PURANA/BADA extreme point (bade timeframe -- jitna data hai utna -- ka ekdum LOWEST/HIGHEST)
+    + 1 RECENT/CHOTA extreme point (chote timeframe, last 4hr ka lowest/highest) ko jodo.
+    SACH: swing-point selection ka koi ek 'sahi' tareeka nahi hota -- ye ek reasonable automated
+    version hai, haath se khinchi chart-line se thoda alag ho sakta hai. Jitna kam history hai utna
+    hi weak/short ye trendline hogi -- naye deploy ke turant baad "bada" wala point bhi recent hi hoga."""
+    rows = con.execute("SELECT ts,v FROM m WHERE src=? AND k='mark' ORDER BY ts", (src,)).fetchall()
+    if len(rows) < 50:
+        return None
+    cur_px = rows[-1][1]
+
+    big_candles = _resample_ohlc(rows, big_bucket)          # jitna data hai utna -- "bada" timeframe
+    small_rows = [(ts, v) for ts, v in rows if ts >= now - small_lookback]
+    small_candles = _resample_ohlc(small_rows, small_bucket)
+    if len(big_candles) < 3 or len(small_candles) < 3:
+        return None
+
+    big_low_ts, big_low = min(((t, c[2]) for t, c in big_candles), key=lambda x: x[1])
+    small_low_ts, small_low = min(((t, c[2]) for t, c in small_candles), key=lambda x: x[1])
+    support = _project_line(big_low_ts, big_low, small_low_ts, small_low, now)
+
+    big_high_ts, big_high = max(((t, c[1]) for t, c in big_candles), key=lambda x: x[1])
+    small_high_ts, small_high = max(((t, c[1]) for t, c in small_candles), key=lambda x: x[1])
+    resistance = _project_line(big_high_ts, big_high, small_high_ts, small_high, now)
+
+    out = {"cur": cur_px, "support_line": support, "resistance_line": resistance,
+           "support_pts": ((big_low_ts, big_low), (small_low_ts, small_low)),
+           "resistance_pts": ((big_high_ts, big_high), (small_high_ts, small_high)),
+           "hist_hours": (now - rows[0][0]) / 3600.0}
+    out["support_broken"] = support is not None and cur_px < support
+    out["resistance_broken"] = resistance is not None and cur_px > resistance
+    return out
+
+
 def trade_plan(con, now):
     px = current_mark(con)
     if px is None:
@@ -233,8 +290,11 @@ def trade_plan(con, now):
         vals = [r[0] for r in rows]
         mean = sum(vals) / len(vals)
         vol = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
-    sl_fallback = max((vol or 0) * 1.5, 150)
-    tp_fallback = sl_fallback * 2
+    # SL ko pehle se zyada breathing room -- taaki normal wick/noise me pre-time stop na lage
+    sl_fallback = max((vol or 0) * 2.2, 220)
+    tp_fallback = sl_fallback * 1.3   # pehle 2x tha -- ab chhota, zyada achievable target (win% priority)
+    SL_BUFFER = 40  # pehle 20 -- zone ke thoda aage SL, taaki zone ka normal wick SL ko na choo le
+    TP_REACH = 0.7  # zone tak pura jaane ke bajaye 70% distance pe TP -- target hit chance zyada
     reliable = [(z, st) for z, st in (near or []) if st["touch"] >= 5]
     support = resistance = None
     for z, st in reliable:
@@ -247,12 +307,20 @@ def trade_plan(con, now):
             "reliable": len(reliable), "wick_zones": wick_zones}
     if direction == "LONG":
         plan["entry"] = px
-        plan["sl"] = support[0] - 20 if support else px - sl_fallback
-        plan["tp"] = resistance[0] - 20 if resistance else px + tp_fallback
+        plan["sl"] = support[0] - SL_BUFFER if support else px - sl_fallback
+        if resistance:
+            raw_target = resistance[0] - SL_BUFFER
+            plan["tp"] = px + (raw_target - px) * TP_REACH
+        else:
+            plan["tp"] = px + tp_fallback
     elif direction == "SHORT":
         plan["entry"] = px
-        plan["sl"] = resistance[0] + 20 if resistance else px + sl_fallback
-        plan["tp"] = support[0] + 20 if support else px - tp_fallback
+        plan["sl"] = resistance[0] + SL_BUFFER if resistance else px + sl_fallback
+        if support:
+            raw_target = support[0] + SL_BUFFER
+            plan["tp"] = px - (px - raw_target) * TP_REACH
+        else:
+            plan["tp"] = px - tp_fallback
     else:
         plan["entry"] = plan["sl"] = plan["tp"] = None
     if plan["entry"] is not None:
@@ -340,6 +408,113 @@ def breakout_check(con, now):
 
     level = aw_px if near_wall else zone_res[0]
     return {"level": level, "price": px, "verdict": verdict, "col": col, "reasons": reasons}
+
+
+def realized_vol_pct(con, now, window=3600):
+    """SACH: ye rigorous realized-vol formula NAHI hai (log-returns ka proper annualized stdev nahi
+    use kiya) -- sirf price-level ka % stdev annualize karke ek 'IV se roughly compare karne layak'
+    number banaya hai. Real quant-grade realized vol se alag number aa sakta hai, direction/scale
+    samajhne ke liye hi use karo, exact % pe bharosa mat karo."""
+    rows = con.execute("SELECT v FROM m WHERE src='binance' AND k='mark' AND ts>?", (now - window,)).fetchall()
+    if len(rows) < 10:
+        return None
+    vals = [r[0] for r in rows]
+    mean = sum(vals) / len(vals)
+    if mean == 0:
+        return None
+    sd = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
+    frac = sd / mean
+    periods_per_year = (365 * 24 * 3600) / window
+    return frac * (periods_per_year ** 0.5) * 100
+
+
+def option_sell_view(con, now):
+    """EXPERIMENTAL -- option-selling ke liye directional trade_plan() se ALAG nazariya hai:
+    yahan dekhna hai (1) range-bound hai ya bada move aane wala hai, (2) agar direction hai to
+    kaunsi taraf (CALL ya PUT) bechna 'safer' hai.
+    Ab Delta ke options-chain se ATM implied-vol (IV) bhi use karta hai, realized-vol ke against
+    compare karne ke liye, aur bias ka pichhle 2hr ka oscillation bhi (factor_log se) -- taaki
+    'range tootega ya nahi' ka read thoda zyada data-driven ho.
+    SACH -- phir bhi: theta/time-decay, bid-ask spread, aur actual premium pricing IGNORE ho raha
+    hai. Isko options-pricing ka substitute mat samjho, sirf ek extra input hai."""
+    px = current_mark(con)
+    if px is None:
+        return None
+    sc, label, _ = bias_calc(con, now)
+    near = sr_zones(con, now)
+    ww = wall_watch(con, now) or {}
+    L = latest(con)
+    g = lambda s, k: (L[(s, k)][0] if (s, k) in L else None)
+
+    rows = con.execute("SELECT v FROM m WHERE src='binance' AND k='mark' AND ts>?", (now - 3600,)).fetchall()
+    vol = None
+    if len(rows) > 10:
+        vals = [r[0] for r in rows]
+        mean = sum(vals) / len(vals)
+        vol = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
+
+    hist = con.execute("SELECT bias_score FROM factor_log WHERE ts>? AND bias_score IS NOT NULL", (now - 7200,)).fetchall()
+    bias_osc = None
+    if len(hist) >= 5:
+        vals = [h[0] for h in hist]
+        m = sum(vals) / len(vals)
+        bias_osc = (sum((x - m) ** 2 for x in vals) / len(vals)) ** 0.5
+
+    atm_iv = g("options", "atm_iv")
+    days_exp = g("options", "days_to_expiry")
+    rv = realized_vol_pct(con, now)
+
+    rb_score, rb_reasons = 0, []
+    if abs(sc) < 2:
+        rb_score += 1; rb_reasons.append("bias weak/neutral hai (%+.1f)" % sc)
+    else:
+        rb_score -= 1; rb_reasons.append("bias strong hai (%+.1f) -- directional move risk" % sc)
+    bid_status = ww.get("bid", (None,))[0]
+    ask_status = ww.get("ask", (None,))[0]
+    if bid_status == "ABHI BHI KHADA HAI" and ask_status == "ABHI BHI KHADA HAI":
+        rb_score += 1; rb_reasons.append("dono walls (bid+ask) abhi solid khade hain")
+    elif bid_status and "EATEN" in bid_status or (ask_status and "EATEN" in ask_status):
+        rb_score -= 1; rb_reasons.append("ek wall eaten ho rahi hai -- range toot sakta hai")
+    if vol is not None:
+        if vol < 150:
+            rb_score += 1; rb_reasons.append("pichhle 1hr volatility kam hai (%.0f)" % vol)
+        elif vol > 350:
+            rb_score -= 1; rb_reasons.append("pichhle 1hr volatility zyada hai (%.0f)" % vol)
+    if bias_osc is not None:
+        if bias_osc > 1.5:
+            rb_score += 1; rb_reasons.append("bias pichhle 2hr me bahut oscillate kar raha hai (%.1f) -- indecision" % bias_osc)
+        elif bias_osc < 0.5 and abs(sc) >= 2:
+            rb_score -= 1; rb_reasons.append("bias stable + strong hai (osc %.1f) -- trending ho sakta hai" % bias_osc)
+    if atm_iv is not None and rv is not None and rv > 0:
+        if atm_iv > rv * 1.2:
+            rb_score += 1; rb_reasons.append("IV (%.1f%%) realized-vol (%.1f%%) se zyada hai -- premium rich lag raha hai, selling favorable" % (atm_iv, rv))
+        elif atm_iv < rv * 0.8:
+            rb_score -= 1; rb_reasons.append("IV (%.1f%%) realized-vol (%.1f%%) se kam hai -- market jitna hil raha hai utna priced in nahi, risky" % (atm_iv, rv))
+
+    if rb_score >= 2:
+        rb_verdict, rb_col = "RANGE-BOUND zyada likely -- selling ke liye thoda favorable", "#4ade80"
+    elif rb_score <= -1:
+        rb_verdict, rb_col = "MOVE-RISK zyada -- naked selling abhi risky", "#f87171"
+    else:
+        rb_verdict, rb_col = "MIXED -- clear nahi", "#999"
+
+    safer_side = ref_level = None
+    if sc > 0.5:
+        safer_side = "PUT bechna (support ke support pe, price support se neeche na jaaye ye bet)"
+        for z, st in (near or []):
+            if z < px and st["touch"] >= 5 and st["up"] / st["touch"] >= 0.5 and (ref_level is None or z > ref_level):
+                ref_level = z
+    elif sc < -0.5:
+        safer_side = "CALL bechna (resistance ke upar, price resistance se upar na jaaye ye bet)"
+        for z, st in (near or []):
+            if z > px and st["touch"] >= 5 and st["down"] / st["touch"] >= 0.5 and (ref_level is None or z < ref_level):
+                ref_level = z
+    else:
+        safer_side = None
+
+    return {"price": px, "bias_score": sc, "rb_score": rb_score, "rb_verdict": rb_verdict,
+            "rb_col": rb_col, "rb_reasons": rb_reasons, "safer_side": safer_side, "ref_level": ref_level,
+            "vol": vol, "atm_iv": atm_iv, "days_exp": days_exp, "rv": rv, "bias_osc": bias_osc}
 
 
 def plain_setup(con, now):
@@ -461,6 +636,49 @@ def render():
         lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: ye proven probability NAHI hai, sirf abhi ke flow+wall+whale ko milake ek quick-check hai.</div>")
         rows_html.append("<div class='box' style='border:1px solid #666'>" + "".join(lines) + "</div>")
 
+    tl = trendline_break(con, now)
+    if tl:
+        near_zones = sr_zones(con, now) or []
+        reliable_zones = [(z, st) for z, st in near_zones if st["touch"] >= 5]
+        lines = ["<div class='hdr'>TRENDLINE CHECK (auto -- purana bada low/high + recent chota low/high jodke)</div>"]
+        if tl["support_broken"]:
+            nearest_sup = max((z for z, st in reliable_zones if z < tl["cur"]), default=None)
+            extra = " aur ek SR zone $%.0f bhi neeche hai -- dono confirm" % nearest_sup if nearest_sup else " (koi SR zone abhi confirm nahi kar raha, akela trendline break hai)"
+            lines.append("<div style='font-weight:700;color:#f87171'>Support trendline (~$%.0f) ke NEECHE close -- bearish break%s</div>" % (tl["support_line"], extra))
+        elif tl["resistance_broken"]:
+            nearest_res = min((z for z, st in reliable_zones if z > tl["cur"]), default=None)
+            extra = " aur ek SR zone $%.0f bhi upar hai -- dono confirm" % nearest_res if nearest_res else " (koi SR zone abhi confirm nahi kar raha, akela trendline break hai)"
+            lines.append("<div style='font-weight:700;color:#4ade80'>Resistance trendline (~$%.0f) ke UPAR close -- bullish break%s</div>" % (tl["resistance_line"], extra))
+        else:
+            lines.append("<div style='color:#999'>Abhi dono trendline (support ~$%.0f, resistance ~$%.0f) ke beech hai -- koi break nahi</div>" %
+                         ((tl["support_line"] or 0), (tl["resistance_line"] or 0)))
+        if tl["hist_hours"] < 24:
+            lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: abhi sirf %.1f ghante ka data hai -- 'bada timeframe' wala point bhi recent hi hai, trendline weak/short-term hai. Jaise-jaise data badhega, zyada reliable hoga.</div>" % tl["hist_hours"])
+        lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: ye ek automated swing-point choice hai, haath se khinchi trendline se thoda alag ho sakti hai -- koi ek 'sahi' trendline nahi hoti.</div>")
+        rows_html.append("<div class='box' style='border:1px solid #666'>" + "".join(lines) + "</div>")
+
+    ov = option_sell_view(con, now)
+    if ov:
+        lines = ["<div class='hdr'>OPTION SELLING VIEW (EXPERIMENTAL)</div>",
+                 "<div style='font-weight:700;color:%s'>%s</div>" % (ov["rb_col"], ov["rb_verdict"])]
+        if ov["rb_reasons"]:
+            lines.append("<div class='small' style='margin-top:4px'>" + esc("; ".join(ov["rb_reasons"])) + "</div>")
+        if ov["safer_side"]:
+            lines.append("<div class='small' style='margin-top:6px'><b>Safer side (bias ke hisab se):</b> %s</div>" % esc(ov["safer_side"]))
+            if ov["ref_level"]:
+                lines.append("<div class='small'>Reference level (SR zone, exact strike nahi): $%.0f</div>" % ov["ref_level"])
+        else:
+            lines.append("<div class='small' style='margin-top:6px'>Bias bilkul neutral hai -- ek taraf favor karne layak signal nahi, dono taraf risk barabar lag raha hai.</div>")
+        if ov["atm_iv"] is not None:
+            lines.append("<div class='small' style='margin-top:6px'>ATM IV (nearest expiry%s): %.1f%%</div>" %
+                         ((", %.1f din baaki" % ov["days_exp"]) if ov["days_exp"] is not None else "", ov["atm_iv"]))
+        if ov["rv"] is not None:
+            lines.append("<div class='small'>Realized vol (1hr se andaza, annualized): %.1f%%</div>" % ov["rv"])
+        if ov["atm_iv"] is None:
+            lines.append("<div class='small' style='color:#666'>(options-chain data abhi nahi mila -- naya venue hai, deploy ke baad check karna)</div>")
+        lines.append("<div class='small' style='color:#666;margin-top:6px'>SACH: theta/time-decay, bid-ask spread, actual premium pricing IGNORE ho raha hai -- ye sirf directional+range ka heuristic hai, options-pricing ka substitute nahi. Blindly mat bechna.</div>")
+        rows_html.append("<div class='box' style='border:1px solid #666'>" + "".join(lines) + "</div>")
+
     ps = plain_setup(con, now)
     confcol = {"zyada": "#1b7a3a", "medium": "#8a6d1b", "halki": "#555", "sirf-bias": "#555"}
     dircol = {"LONG": "#4ade80", "SHORT": "#f87171"}
@@ -518,13 +736,22 @@ def render():
             lines.append("<div class='wrow'>%s..%s <b>%s</b> B $%.1fM / S $%.1fM</div>" % (a[:6], a[-4:], lab, b_ / 1e6, s_ / 1e6))
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
-    top = q(con, "SELECT addr,szi,entry,usd FROM w WHERE ts=(SELECT MAX(ts) FROM w) ORDER BY usd DESC LIMIT 5")
+    top = q(con, "SELECT addr,szi,entry,usd,liq FROM w WHERE ts=(SELECT MAX(ts) FROM w) ORDER BY usd DESC LIMIT 5")
     if top:
+        cur_px = current_mark(con)
         lines = ["<div class='hdr'>Top whale positions</div>"]
-        for a, szi, e, usd in top:
+        for a, szi, e, usd, liq in top:
             side = "LONG" if szi > 0 else "SHORT"
             cls = "up" if szi > 0 else "dn"
-            lines.append("<div class='wrow %s'>%s..%s %s %.2f BTC @ %.0f ($%.1fM)</div>" % (cls, a[:6], a[-4:], side, abs(szi), e or 0, usd / 1e6))
+            base = "<div class='wrow %s'>%s..%s %s %.2f BTC @ %.0f ($%.1fM)" % (cls, a[:6], a[-4:], side, abs(szi), e or 0, usd / 1e6)
+            if liq:
+                dist_txt = ""
+                if cur_px:
+                    dist_pct = abs(cur_px - liq) / cur_px * 100
+                    dist_txt = " -- abhi se %.1f%% door" % dist_pct
+                base += " -- <span style='color:#f87171'>LIQ $%.0f</span>%s" % (liq, dist_txt)
+            lines.append(base + "</div>")
+        lines.append("<div class='small' style='color:#666;margin-top:4px'>LIQ = jahan ye position forced-close hogi -- us point pe exchange khud market order fire karta hai, jo price ko us hi disha me aur dhakka de sakta hai (cascade ka risk).</div>")
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     conv = whale_conviction(con)
@@ -568,12 +795,19 @@ def render():
     pw = pig_vs_whale(con)
     if pw:
         pig_net, whale_net, diverge = pw
-        lines = ["<div class='hdr'>Chhote players (pig-tier) vs Whale</div>",
-                 "<div class='small'>Pig net flow: %+.0f USD</div>" % pig_net]
-        if whale_net is not None:
-            lines.append("<div class='small'>Whale net flow: %+.0f USD</div>" % whale_net)
+        lines = ["<div class='hdr'>Sab tiers net flow (PIG se BIGDADDY tak)</div>"]
+        radar_all = entry_radar(con)
+        if radar_all:
+            for name, n, net, b_, s_ in radar_all:
+                color = "#4ade80" if net > 0 else ("#f87171" if net < 0 else "#999")
+                lines.append("<div class='small' style='color:%s'>%s (%d wallets) net %+.0f USD</div>" %
+                             (color, name, n, net))
+        else:
+            lines.append("<div class='small'>Pig net flow: %+.0f USD</div>" % pig_net)
+            if whale_net is not None:
+                lines.append("<div class='small'>Whale net flow: %+.0f USD</div>" % whale_net)
         if diverge:
-            lines.append("<div class='small' style='color:#f59e0b'>ULTI disha me hain -- dhyan layak, proof nahi</div>")
+            lines.append("<div class='small' style='color:#f59e0b;margin-top:4px'>PIG aur WHALE ulti disha me hain -- dhyan layak, proof nahi</div>")
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     tr, total_setups = track_record(con)
