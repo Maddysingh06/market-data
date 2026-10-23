@@ -183,7 +183,12 @@ def c_options(H):
         if strike is None:
             continue
         q = t.get("quotes") or {}
+        # BUG FIX: Delta docs confirm bid_iv/ask_iv decimal-fraction format hai (jaise "0.22" = 22%),
+        # whole-number percent NAHI -- pehle *100 missing tha, isliye dashboard 0.2% jaisa galat
+        # number dikha raha tha jabki asli IV ~20% thi. Ab *100 karke sahi percent store kar rahe hain.
         biv, aiv = f(q.get("bid_iv")), f(q.get("ask_iv"))
+        biv = biv * 100 if biv is not None else None
+        aiv = aiv * 100 if aiv is not None else None
         iv = ((biv or 0) + (aiv or 0)) / 2 if (biv is not None and aiv is not None) else (biv if biv is not None else aiv)
         total_oi += f(t.get("oi")) or 0
         if iv is not None:
@@ -298,6 +303,10 @@ def db():
     con.execute("CREATE INDEX IF NOT EXISTS is_ ON setups(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ifl ON factor_log(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS itl ON trendline_log(ts, variant)")
+    # wallet_state -- Whales class ka in-memory wallet-tracking (self.st/vol/flow) yahan persist hota hai,
+    # taaki collector RESTART hone pe ye khaali na ho jaaye (Fighting Bar/bias/whale-list turant wild na ho)
+    con.execute("CREATE TABLE IF NOT EXISTS wallet_state(addr TEXT PRIMARY KEY, bought REAL, sold REAL, "
+                "tk REAL, mk REAL, vol REAL, flow REAL)")
     for stmt in ("ALTER TABLE setups ADD COLUMN eval240 TEXT", "ALTER TABLE setups ADD COLUMN px240 REAL"):
         try:
             con.execute(stmt)
@@ -434,6 +443,42 @@ class Whales:
         self.pending = []
         self.last_slow = 0.0
         self.lock = threading.Lock()
+        self.load_state()
+
+    def load_state(self):
+        """DB me persist kiya hua pichla wallet-tracking state wapas load karta hai --
+        isse collector RESTART hone pe trend_buy/sell, wallet-labels waghera khaali se shuru
+        nahi hote, pichle session ka context carry hota hai."""
+        try:
+            rows = self.con.execute("SELECT addr,bought,sold,tk,mk,vol,flow FROM wallet_state").fetchall()
+        except Exception as e:
+            print("wallet_state load err", e)
+            return
+        n = 0
+        with self.lock:
+            for addr, bought, sold, tk, mk, vol, flow in rows:
+                self.st[addr] = dict(bought=bought or 0.0, sold=sold or 0.0, tk=tk or 0.0, mk=mk or 0.0)
+                if vol:
+                    self.vol[addr] = vol
+                if flow:
+                    self.flow[addr] = flow
+                n += 1
+        if n:
+            print("wallet_state: %d wallets restore kiye (pichle session se)" % n, flush=True)
+
+    def save_state(self):
+        """Abhi ka self.st/vol/flow DB me save karta hai -- taaki agla restart isse continue kar sake."""
+        with self.lock:
+            rows = [(a, s["bought"], s["sold"], s["tk"], s["mk"], self.vol.get(a, 0.0), self.flow.get(a, 0.0))
+                    for a, s in self.st.items()]
+        if not rows:
+            return
+        with LOCK:
+            # pehle purana clear karo -- taaki jo wallet self.st se nikal chuka hai (classify_all ke
+            # prune se), wo yahan stale na reh jaaye
+            self.con.execute("DELETE FROM wallet_state")
+            self.con.executemany(
+                "INSERT INTO wallet_state(addr,bought,sold,tk,mk,vol,flow) VALUES(?,?,?,?,?,?,?)", rows)
 
     def on_msg(self, raw):
         m = json.loads(raw) if isinstance(raw, str) else raw
@@ -581,6 +626,7 @@ class Whales:
                     d[k] *= 0.5
                     if abs(d[k]) < 50_000:
                         del d[k]
+        self.save_state()
         self.con.commit()
 
     def ws_thread(self):
