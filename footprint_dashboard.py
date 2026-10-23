@@ -455,7 +455,7 @@ body{background:#0b0b0f;color:#eee;font-family:-apple-system,Segoe UI,Roboto,san
 </style></head>
 <body>
 <div id="app">Loading...</div>
-<div class="foot">Sirf public data ka andaza hai, saboot nahi. Khud order mat lagao isi par.<br>Har 10s refresh</div>
+<div class="foot">Sirf public data ka andaza hai, saboot nahi. Khud order mat lagao isi par.<br>Har 4s refresh</div>
 <script>
 async function tick(){
   try{
@@ -466,7 +466,7 @@ async function tick(){
   }
 }
 tick();
-setInterval(tick, 10000);
+setInterval(tick, 4000);
 </script>
 </body></html>"""
 

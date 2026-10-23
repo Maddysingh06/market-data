@@ -46,11 +46,11 @@ def tg_send(msg):
 
 
 DB = os.getenv("DB", "market.db")
-EVERY = 60
+EVERY = 30            # pehle 60 -- lag kam karne ke liye (SACH: Hyperliquid rate-limit risk thoda badha hai, ERR aaye to wapas 60 karunga)
 BIG_USD = 300_000
 WHALE_MIN_USD = 1_000_000
 TOP_N = 20
-STATE_EVERY = 60      # wallet position poll (pehle 300)
+STATE_EVERY = 30      # wallet position poll (pehle 60, usse pehle 300)
 SLOW_EVERY = 300      # labels/decay
 BURST_USD, BURST_WIN, BURST_COOL = 500_000, 60, 180
 HL = "https://api.hyperliquid.xyz/info"
