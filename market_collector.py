@@ -232,9 +232,17 @@ def db():
     con.execute("CREATE TABLE IF NOT EXISTS c(ts INT, addr TEXT, label TEXT, bought REAL, sold REAL, maker_n REAL, taker_n REAL, n REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS setups(ts INT, direction TEXT, entry REAL, n_wallets INT, net_score REAL, "
                 "eval15 TEXT, px15 REAL, eval30 TEXT, px30 REAL, eval60 TEXT, px60 REAL, eval240 TEXT, px240 REAL)")
+    # factor_log -- har bias_calc() component ka RAW (clamp se pehle) value, taaki baad me
+    # har factor ki alag-alag accuracy nikali ja sake (kaunsa factor genuinely kaam karta hai, kaunsa noise hai)
+    con.execute("CREATE TABLE IF NOT EXISTS factor_log(ts INT, price REAL, "
+                "hl_trend REAL, burst_cnt REAL, absorb_cnt REAL, slice_cnt REAL, "
+                "coinbase_premium REAL, top_ls REAL, retail_ls REAL, "
+                "dydx_net REAL, gmx_net REAL, orderbook_imb REAL, bias_score REAL, "
+                "px15 REAL, px30 REAL, px60 REAL)")
     con.execute("CREATE INDEX IF NOT EXISTS im ON m(src,k,ts)")
     con.execute("CREATE INDEX IF NOT EXISTS ie ON e(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS is_ ON setups(ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS ifl ON factor_log(ts)")
     for stmt in ("ALTER TABLE setups ADD COLUMN eval240 TEXT", "ALTER TABLE setups ADD COLUMN px240 REAL"):
         try:
             con.execute(stmt)
@@ -614,6 +622,58 @@ def bias_calc(con, now):
     return sc, label, parts
 
 
+FACTOR_COOLDOWN = 120  # har 2 min me ek row -- 30s poll pe bahut dense ho jaata, overlap se galat correlation aa sakta hai
+
+
+def log_factors(con, now):
+    """Har bias_calc() component ka RAW value price ke saath log karta hai -- baad me
+    (jab data zyada ho jaaye) har factor ki alag accuracy/correlation nikalne ke liye.
+    Ye khud koi verdict NAHI deta, sirf raw data jama karta hai."""
+    px = current_mark(con)
+    if px is None:
+        return
+    last = con.execute("SELECT ts FROM factor_log ORDER BY ts DESC LIMIT 1").fetchone()
+    if last and now - last[0] < FACTOR_COOLDOWN:
+        return
+    L = latest(con)
+    g = lambda s, k: L.get((s, k))
+    tb, tsl = g("hyperliquid", "trend_buy_usd"), g("hyperliquid", "trend_sell_usd")
+    hl_trend = (tb - tsl) if (tb is not None and tsl is not None) else None
+    rows = con.execute("SELECT kind,side,COUNT(*) FROM e WHERE ts>? GROUP BY kind,side", (int(now) - 900,)).fetchall()
+    cnt = {(k, s): n for k, s, n in rows}
+    burst_cnt = cnt.get(("BURST", "BULL"), 0) - cnt.get(("BURST", "BEAR"), 0)
+    absorb_cnt = cnt.get(("ABSORB", "BULL"), 0) - cnt.get(("ABSORB", "BEAR"), 0)
+    slice_cnt = cnt.get(("SLICE", "BULL"), 0) - cnt.get(("SLICE", "BEAR"), 0)
+    cp = g("derived", "coinbase_premium_usd")
+    tp, rl = g("binance", "top_pos_ls"), g("binance", "retail_ls")
+    db_, ds_ = g("dydx", "recent_buy_usd"), g("dydx", "recent_sell_usd")
+    dydx_net = (db_ - ds_) if (db_ is not None and ds_ is not None) else None
+    gl, gs = g("gmx", "long_usd"), g("gmx", "short_usd")
+    gmx_net = (gl - gs) if (gl is not None and gs is not None) else None
+    bu, au = g("depth", "bid_usd"), g("depth", "ask_usd")
+    ob_imb = (bu - au) if (bu is not None and au is not None) else None
+    sc, _, _ = bias_calc(con, now)
+    with LOCK:
+        con.execute("INSERT INTO factor_log(ts,price,hl_trend,burst_cnt,absorb_cnt,slice_cnt,"
+                   "coinbase_premium,top_ls,retail_ls,dydx_net,gmx_net,orderbook_imb,bias_score) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (int(now), px, hl_trend, burst_cnt, absorb_cnt, slice_cnt, cp, tp, rl, dydx_net, gmx_net, ob_imb, sc))
+
+
+def evaluate_factors(con, now):
+    """factor_log ke purane rows me forward price (15/30/60 min baad) bhar deta hai --
+    isse baad me 'factor value vs actual price move' correlation nikal sakenge."""
+    px = current_mark(con)
+    if px is None:
+        return
+    for col, win in (("px15", 900), ("px30", 1800), ("px60", 3600)):
+        rows = con.execute("SELECT rowid FROM factor_log WHERE %s IS NULL AND ts<=?" % col,
+                           (int(now) - win,)).fetchall()
+        for (rowid,) in rows:
+            with LOCK:
+                con.execute("UPDATE factor_log SET %s=? WHERE rowid=?" % col, (px, rowid))
+
+
 # ------------- paisa flow synthesis (price + OI milake) -------------
 OI_FIELD = {"binance": "oi_btc", "bybit": "oi_btc", "okx": "oi_btc", "delta": "oi"}
 FLOW_WIN = 900   # 15 min
@@ -926,8 +986,11 @@ def trade_plan(con, now):
         mean = sum(vals) / len(vals)
         var = sum((x - mean) ** 2 for x in vals) / len(vals)
         vol = var ** 0.5
-    sl_fallback = max((vol or 0) * 1.5, 150)
-    tp_fallback = sl_fallback * 2
+    # SL ko pehle se zyada breathing room -- taaki normal wick/noise me pre-time stop na lage
+    sl_fallback = max((vol or 0) * 2.2, 220)
+    tp_fallback = sl_fallback * 1.3   # pehle 2x tha -- ab chhota, zyada achievable target (win% priority)
+    SL_BUFFER = 40  # pehle 20
+    TP_REACH = 0.7  # zone tak pura jaane ke bajaye 70% distance pe TP -- hit chance zyada
 
     reliable = [(z, st) for z, st in (near or []) if st["touch"] >= 5]
     support = resistance = None
@@ -945,12 +1008,20 @@ def trade_plan(con, now):
             "reliable_zones": len(reliable), "wick_zones": wick_zones}
     if direction == "LONG":
         plan["entry"] = px
-        plan["sl"] = support[0] - 20 if support else px - sl_fallback
-        plan["tp"] = resistance[0] - 20 if resistance else px + tp_fallback
+        plan["sl"] = support[0] - SL_BUFFER if support else px - sl_fallback
+        if resistance:
+            raw_target = resistance[0] - SL_BUFFER
+            plan["tp"] = px + (raw_target - px) * TP_REACH
+        else:
+            plan["tp"] = px + tp_fallback
     elif direction == "SHORT":
         plan["entry"] = px
-        plan["sl"] = resistance[0] + 20 if resistance else px + sl_fallback
-        plan["tp"] = support[0] + 20 if support else px - tp_fallback
+        plan["sl"] = resistance[0] + SL_BUFFER if resistance else px + sl_fallback
+        if support:
+            raw_target = support[0] + SL_BUFFER
+            plan["tp"] = px - (px - raw_target) * TP_REACH
+        else:
+            plan["tp"] = px - tp_fallback
     else:
         plan["entry"] = plan["sl"] = plan["tp"] = None
     if plan["entry"] is not None:
@@ -1143,6 +1214,8 @@ def run():
             last_state = time.time()
         log_setup(con, time.time())
         evaluate_setups(con, time.time())
+        log_factors(con, time.time())
+        evaluate_factors(con, time.time())
         sc, label, parts = bias_calc(con, time.time())
         put(con, ts, "footprint", "bias_score", sc)
         if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
