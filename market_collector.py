@@ -552,6 +552,61 @@ def snapshot(con, H=http):
     return ts
 
 
+# ------------- support/resistance zones (price history se, bahut kam data abhi) -------------
+SR_ZONE = 150      # USD bin size
+SR_LOOK_FWD = 300  # is zone ko chhune ke baad 5 min aage dekho
+SR_REV_MOVE = 80   # itna ulta gaya to "reverse" mana
+
+
+def sr_zones(con, now, src="binance", lookback=SR_LOOK_FWD * 40):
+    rows = con.execute("SELECT ts,v FROM m WHERE src=? AND k='mark' AND ts>? ORDER BY ts",
+                       (src, now - lookback)).fetchall()
+    if len(rows) < 20:
+        return None, len(rows)
+    ts_arr = [r[0] for r in rows]
+    px_arr = [r[1] for r in rows]
+    cur = px_arr[-1]
+    zone_of = lambda p: round(p / SR_ZONE) * SR_ZONE
+    stats = collections.defaultdict(lambda: {"touch": 0, "up": 0, "down": 0, "flat": 0})
+    n = len(rows)
+    i = 0
+    last_zone_hit = None
+    while i < n:
+        z = zone_of(px_arr[i])
+        if z != last_zone_hit:
+            j = i
+            while j < n and ts_arr[j] - ts_arr[i] < SR_LOOK_FWD:
+                j += 1
+            if j < n:
+                move = px_arr[j] - px_arr[i]
+                st = stats[z]
+                st["touch"] += 1
+                if move > SR_REV_MOVE:
+                    st["up"] += 1
+                elif move < -SR_REV_MOVE:
+                    st["down"] += 1
+                else:
+                    st["flat"] += 1
+            last_zone_hit = z
+        i += 1
+    near = sorted(stats.items(), key=lambda kv: abs(kv[0] - cur))[:4]
+    return near, n
+
+
+def print_sr(con, now):
+    near, npoints = sr_zones(con, now)
+    print("\n--- SUPPORT/RESISTANCE ZONES (%s price-points se, itna kam data noise hai) ---" % npoints)
+    if not near:
+        print("   abhi itna data nahi (%d points). Kam se kam kuch din chahiye, isse pehle ye mat maanna." % npoints)
+        return
+    for zone, st in near:
+        tot = st["touch"]
+        if tot == 0:
+            continue
+        print("   zone $%.0f : %d touch -> upar gaya %d (%.0f%%), neeche gaya %d (%.0f%%), flat %d  [sample bahut chhota, bharosa mat karo abhi]" %
+              (zone, tot, st["up"], st["up"] / tot * 100, st["down"], st["down"] / tot * 100, st["flat"]))
+
+
 def report(con):
     L = latest(con)
     if not L:
@@ -585,6 +640,7 @@ def report(con):
     print("   " + (", ".join(parts) if parts else "koi footprint nahi mila"))
     print("\n--- PAISA FLOW (15 min, price+OI) ---")
     print(synthesize(con, now))
+    print_sr(con, now)
     ev = con.execute("SELECT ts,venue,kind,side,note FROM e WHERE ts>? ORDER BY ts DESC LIMIT 10", (int(now) - 1800,)).fetchall()
     if ev:
         print("\nPichhle 30 min ke events:")
