@@ -277,6 +277,63 @@ def trendline_break(con, now, src="binance", big_bucket=3600, small_bucket=300, 
     return out
 
 
+# ------------- wick-hunt check -- recent sharp spike+reversal + abhi ka bias/whale alignment -------------
+WH_WINDOW = 900          # pichhle 15 min me dekho
+WH_MIN_SPIKE = 150       # itna chhota spike wick-hunt nahi maanenge
+WH_RETRACE_FRAC = 0.5    # spike ka kam se kam itna % wapas aa chuka ho, tabhi "hunt ho chuki" maano
+
+
+def wick_hunt_check(con, now):
+    """Pichhle WH_WINDOW (15 min) me koi sharp spike (wick, SL cluster hunt jaisa) hua aur price
+    usse kaafi (WH_RETRACE_FRAC) wapas aa chuka hai kya -- agar haan, AUR abhi ka bias/whale-flow
+    us 'wapas' direction ko support kare, tabhi 'tez move aa sakta hai' flag hota hai.
+    SACH: heuristic hai -- wick hui iska matlab move GUARANTEED nahi, sirf ek extra confirming
+    signal hai jo hunt+alignment dono mile tabhi trigger karta hai."""
+    rows = con.execute("SELECT ts,v FROM m WHERE src='binance' AND k='mark' AND ts>? ORDER BY ts",
+                       (now - WH_WINDOW,)).fetchall()
+    if len(rows) < 10:
+        return None
+    baseline = rows[0][1]
+    cur_ts, cur = rows[-1]
+    low_ts, low_val = min(rows, key=lambda r: r[1])
+    high_ts, high_val = max(rows, key=lambda r: r[1])
+
+    candidates = []
+    if low_ts != cur_ts:
+        down_spike = baseline - low_val
+        retrace = cur - low_val
+        if down_spike >= WH_MIN_SPIKE and retrace >= down_spike * WH_RETRACE_FRAC:
+            candidates.append(("NEECHE WICK-HUNT HUI", low_val, down_spike, retrace, "UP"))
+    if high_ts != cur_ts:
+        up_spike = high_val - baseline
+        retrace = high_val - cur
+        if up_spike >= WH_MIN_SPIKE and retrace >= up_spike * WH_RETRACE_FRAC:
+            candidates.append(("UPAR WICK-HUNT HUI", high_val, up_spike, retrace, "DOWN"))
+    if not candidates:
+        return None
+    kind, extreme, spike, retrace, expect_dir = max(candidates, key=lambda c: c[2])  # bada spike wala lo
+
+    sc, label, _ = bias_calc(con, now)
+    conv = whale_conviction(con)
+    press_long = sum((x[2] or 0) for x in conv if x[3] == "PRESSING LONG")
+    press_short = sum((x[2] or 0) for x in conv if x[3] == "PRESSING SHORT")
+
+    supports = []
+    if expect_dir == "UP":
+        if sc > 0.5:
+            supports.append("bias bullish (%+.1f)" % sc)
+        if press_long > 0 and press_long >= press_short * 1.3:
+            supports.append("whales long press kar rahe hain")
+    else:
+        if sc < -0.5:
+            supports.append("bias bearish (%+.1f)" % sc)
+        if press_short > 0 and press_short >= press_long * 1.3:
+            supports.append("whales short press kar rahe hain")
+
+    return {"kind": kind, "extreme": extreme, "spike": spike, "retrace": retrace,
+            "expect_dir": expect_dir, "aligned": len(supports) > 0, "supports": supports, "cur": cur}
+
+
 def trade_plan(con, now):
     px = current_mark(con)
     if px is None:
@@ -589,6 +646,17 @@ def render():
     rows_html.append("<div class='price'>BTC $%s</div>" % (("%.0f" % mark) if mark else "--"))
     if stale:
         rows_html.append("<div class='warn'>DATA %.0f MIN PURANA -- collector check karo</div>" % (data_age / 60))
+
+    wh = wick_hunt_check(con, now)
+    if wh and wh["aligned"]:
+        wcol = "#4ade80" if wh["expect_dir"] == "UP" else "#f87171"
+        rows_html.append(
+            "<div class='box' style='border:2px solid %s;background:#1a1a1a'>"
+            "<div class='hdr' style='color:%s'>⚡ WICK HUNT ALERT</div>"
+            "<div style='font-weight:700;color:%s'>%s (~%.0f pts spike, %.0f pts wapas aa chuka) -- %s taraf tez move ka chance</div>"
+            "<div class='small' style='margin-top:4px'>%s</div>"
+            "<div class='small' style='color:#666;margin-top:4px'>SACH: heuristic hai, guarantee nahi -- wick hui iska matlab move pakka nahi.</div>"
+            "</div>" % (wcol, wcol, wcol, wh["kind"], wh["spike"], wh["retrace"], wh["expect_dir"], esc("; ".join(wh["supports"]))))
 
     bsp = buy_sell_pressure(con)
     if bsp:

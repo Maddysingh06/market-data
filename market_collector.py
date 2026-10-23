@@ -1031,6 +1031,66 @@ def wall_watch(con, now):
     return out or None
 
 
+# ------------- wick-hunt check -- recent sharp spike+reversal + abhi ka bias/whale alignment -------------
+WH_WINDOW = 900          # pichhle 15 min me dekho
+WH_MIN_SPIKE = 150       # itna chhota spike wick-hunt nahi maanenge
+WH_RETRACE_FRAC = 0.5    # spike ka kam se kam itna % wapas aa chuka ho, tabhi "hunt ho chuki" maano
+
+
+def wick_hunt_check(con, now):
+    """Pichhle WH_WINDOW (15 min) me koi sharp spike (wick, SL cluster hunt jaisa) hua aur price
+    usse kaafi (WH_RETRACE_FRAC) wapas aa chuka hai kya -- agar haan, AUR abhi ka bias/whale-flow
+    us 'wapas' direction ko support kare, tabhi 'tez move aa sakta hai' flag hota hai.
+    SACH: heuristic hai -- wick hui iska matlab move GUARANTEED nahi, sirf ek extra confirming
+    signal hai jo hunt+alignment dono mile tabhi trigger karta hai."""
+    rows = con.execute("SELECT ts,v FROM m WHERE src='binance' AND k='mark' AND ts>? ORDER BY ts",
+                       (now - WH_WINDOW,)).fetchall()
+    if len(rows) < 10:
+        return None
+    baseline = rows[0][1]
+    cur_ts, cur = rows[-1]
+    low_ts, low_val = min(rows, key=lambda r: r[1])
+    high_ts, high_val = max(rows, key=lambda r: r[1])
+
+    candidates = []
+    if low_ts != cur_ts:
+        down_spike = baseline - low_val
+        retrace = cur - low_val
+        if down_spike >= WH_MIN_SPIKE and retrace >= down_spike * WH_RETRACE_FRAC:
+            candidates.append(("NEECHE WICK-HUNT HUI", low_val, down_spike, retrace, "UP"))
+    if high_ts != cur_ts:
+        up_spike = high_val - baseline
+        retrace = high_val - cur
+        if up_spike >= WH_MIN_SPIKE and retrace >= up_spike * WH_RETRACE_FRAC:
+            candidates.append(("UPAR WICK-HUNT HUI", high_val, up_spike, retrace, "DOWN"))
+    if not candidates:
+        return None
+    kind, extreme, spike, retrace, expect_dir = max(candidates, key=lambda c: c[2])  # bada spike wala lo
+
+    sc, label, _ = bias_calc(con, now)
+    conv = whale_conviction(con, now)
+    # NOTE: verdict TEXT yahan collector me suffix ke saath hai ("PRESSING LONG (aur bada rahah hai)"),
+    # dashboard wale se alag -- isiliye string-match ke bajaye side+sign se "pressing" nikal rahe hain
+    # (sign=1 matlab LONG side pe pressing, SHORT side pe sign=-1 matlab pressing -- dono "badh raha" hain).
+    press_long = sum((x[2] or 0) for x in conv if x[1] == "LONG" and x[4] == 1)
+    press_short = sum((x[2] or 0) for x in conv if x[1] == "SHORT" and x[4] == -1)
+
+    supports = []
+    if expect_dir == "UP":
+        if sc > 0.5:
+            supports.append("bias bullish (%+.1f)" % sc)
+        if press_long > 0 and press_long >= press_short * 1.3:
+            supports.append("whales long press kar rahe hain")
+    else:
+        if sc < -0.5:
+            supports.append("bias bearish (%+.1f)" % sc)
+        if press_short > 0 and press_short >= press_long * 1.3:
+            supports.append("whales short press kar rahe hain")
+
+    return {"kind": kind, "extreme": extreme, "spike": spike, "retrace": retrace,
+            "expect_dir": expect_dir, "aligned": len(supports) > 0, "supports": supports, "cur": cur}
+
+
 SETUP_MIN_WALLETS = 3
 SETUP_MAJORITY = 0.6     # 60% ya zyada wallets ek disha me ho
 SETUP_COOLDOWN = 900     # ek disha me dubara log karne se pehle 15 min ruko
@@ -1337,6 +1397,8 @@ def run():
             print("thread start fail", e)
     last_state = 0
     last_bias_alert = [0.0]
+    last_wh_alert = [0.0]
+    WH_COOLDOWN = 1200  # ek wick-hunt alert ke baad 20 min dusra nahi
     print("collector chalu. DB=%s (Ctrl+C band)" % DB)
     if TG_TOKEN and TG_CHAT:
         tg_send("Collector chalu ho gaya, bhai. BURST/ABSORB events yahan aayenge.")
@@ -1363,6 +1425,13 @@ def run():
         if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
             last_bias_alert[0] = time.time()
             tg_send("FOOTPRINT BIAS: %s (score %+.1f)\n%s\n(confidence LOW, weights untested)" % (label, sc, ", ".join(parts) if parts else "-"))
+        hunt = wick_hunt_check(con, time.time())
+        if hunt and hunt["aligned"] and (time.time() - last_wh_alert[0]) > WH_COOLDOWN:
+            last_wh_alert[0] = time.time()
+            msg = ("%s (~%.0f pts spike, %.0f pts wapas aa chuka hai) -- agar %s taraf tez move aana hai toh abhi ka time hai.\n%s\nSACH: heuristic hai, guarantee nahi." %
+                  (hunt["kind"], hunt["spike"], hunt["retrace"], hunt["expect_dir"], "; ".join(hunt["supports"])))
+            print("WICK HUNT ALERT: %s" % msg.replace("\n", " "), flush=True)
+            tg_send(msg)
         con.commit()
         time.sleep(max(1, EVERY - (time.time() - t0)))
 
