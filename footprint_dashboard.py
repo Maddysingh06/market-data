@@ -308,7 +308,8 @@ def render():
             lines.append("<div class='small' style='color:#4ade80'>TP: $%.0f (%.0f points)</div>" % (ps["tp"], ps["tp_pts"]))
         else:
             lines.append("<div class='small' style='color:#888'>SL/TP abhi nahi dikha raha -- whale-direction aur overall-bias match nahi kar rahe, mixed hai</div>")
-        lines.append("<div class='small' style='margin-top:6px'>Kitni der dekho: agle 15-30 min track karo ki ye whales apni direction continue karte hain. Agar ulta (covering/exit) dikhna shuru ho jaye, setup cancel samjho.</div>")
+        lines.append("<div class='small' style='margin-top:6px'><b>Entry ABHI ka price hai</b> -- entry ke liye wait mat karo, is box ka matlab hi hai ki ye ABHI ho raha hai.</div>")
+        lines.append("<div class='small'>Entry ke BAAD: har 15-30 min isi page ko wapas check karte raho. Agar wahi whale(s) covering/exit dikhne lage ya naya PRESSING ulti taraf aa jaye, thesis khatam samjho -- SL hit hone se pehle bhi nikal sakte ho.</div>")
         warn = " -- isse bahut kam hai, abhi risk mat lena sirf isi pe" if ps["total_setups"] < 20 else ""
         lines.append("<div class='small' style='color:#666;margin-top:4px'>Humara apna track-record system abhi tak %d setups ne test kiya hai%s.</div>" % (ps["total_setups"], warn))
         rows_html.append("<div class='box' style='border:1px solid %s'>" % confcol[ps["conf"]] + "".join(lines) + "</div>")
