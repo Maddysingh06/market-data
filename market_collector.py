@@ -51,7 +51,11 @@ BIG_USD = 300_000
 WHALE_MIN_USD = 1_000_000
 TOP_N = 20
 STATE_EVERY = 30      # wallet position poll (pehle 60, usse pehle 300)
-SLOW_EVERY = 300      # labels/decay
+SLOW_EVERY = 90       # labels/decay -- pehle 300 (5min) tha, bahut lag ho raha tha whale-conviction
+                       # (PRESSING LONG/SHORT) update hone mein. SACH: isse Hyperliquid API calls
+                       # ~3.3x zyada frequent honge (classify_all har 90s chalega) -- rate-limit ERR
+                       # ka risk thoda badh sakta hai (jaisa EVERY 60->30 karne pe bola tha), log me
+                       # "HL state err" ya rate-limit messages dikhe to wapas 180-300 karna.
 BURST_USD, BURST_WIN, BURST_COOL = 500_000, 60, 180
 HL = "https://api.hyperliquid.xyz/info"
 # footprint parameters (meri guess, badal sakte ho)

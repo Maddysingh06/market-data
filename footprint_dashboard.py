@@ -87,6 +87,55 @@ def wall_watch(con, now):
     return out or None
 
 
+def spoof_check(con, now, window=1800):
+    """Order-book wall SPOOFING pakadne ki koshish: ek bada wall (>$500K) dikhta hai, phir agle hi
+    poll (30sec baad) mein SAME price ke paas achanak bahut chhota/gayab ho jaata hai (>70% drop) --
+    agar us 30-60sec window mein us side ka MATCHING trade-volume bahut kam hua (order asal mein
+    EXECUTE nahi hua), toh ye strong signal hai ki wo order sirf CANCEL/PULL kiya gaya tha -- classic
+    spoof pattern (fake wall dikhake doosri taraf ke traders ko trade karwana, phir apna order hata lena).
+
+    SACH: hum sirf har ~30sec mein ek POLL lete hain (poora order-book snapshot) -- agar koi wall
+    isse KAM time mein place+cancel karta hai (jo real high-frequency spoofing mein common hai), hume
+    BILKUL nahi dikhega. Ye sirf SLOWER/manual-type spoofing catch kar sakta hai, millisecond-level
+    algo-spoofing NAHI -- uske liye tick-by-tick order-book-diff feed chahiye hoga, jo abhi nahi hai.
+    Isliye 'spoof detect nahi hua' ka matlab 'spoofing nahi ho rahi' bilkul nahi hai."""
+    rows = con.execute(
+        "SELECT ts,k,v FROM m WHERE src='depth' AND k IN "
+        "('bid_wall_px','bid_wall_usd','ask_wall_px','ask_wall_usd') AND ts>? ORDER BY ts",
+        (int(now) - window,)).fetchall()
+    by_ts = collections.defaultdict(dict)
+    for ts, k, v in rows:
+        by_ts[ts][k] = v
+    stamps = sorted(by_ts)
+    if len(stamps) < 4:
+        return None
+
+    zone_of = lambda p: round(p / 100) * 100
+    out = []
+    for side in ("bid", "ask"):
+        pxk, uk = side + "_wall_px", side + "_wall_usd"
+        series = [(ts, by_ts[ts].get(pxk), by_ts[ts].get(uk)) for ts in stamps if by_ts[ts].get(pxk) and by_ts[ts].get(uk)]
+        for i in range(len(series) - 1):
+            ts0, px0, u0 = series[i]
+            ts1, px1, u1 = series[i + 1]
+            if u0 > 500_000 and zone_of(px0) == zone_of(px1) and u1 < u0 * 0.3:
+                vol_key = "big_sell_usd" if side == "bid" else "big_buy_usd"
+                vol_rows = con.execute(
+                    "SELECT v FROM m WHERE src='hyperliquid' AND k=? AND ts BETWEEN ? AND ?",
+                    (vol_key, ts0, ts1 + 60)).fetchall()
+                matching_vol = sum(v[0] for v in vol_rows) if vol_rows else 0.0
+                drop = u0 - u1
+                if matching_vol < drop * 0.3:
+                    out.append({"side": side, "px": px0, "was_usd": u0, "now_usd": u1,
+                               "matching_vol": matching_vol, "ts": ts1})
+    # duplicate-ish events (same side, bahut paas ke ts) ko squash karo, sirf latest-wala rakho
+    out.sort(key=lambda e: e["ts"])
+    dedup = {}
+    for e in out:
+        dedup[e["side"]] = e
+    return list(dedup.values()) or None
+
+
 def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -198,6 +247,272 @@ def biggest_player(con, now):
     return {"addr": addr, "side": side, "szi": szi, "entry": entry, "liq": liq,
             "usd": usd, "upnl": upnl, "lev": lev, "cur_px": cur_px,
             "push_dir": push_dir, "push_dist_pct": push_dist_pct, "trend": trend}
+
+
+def whale_levels(con):
+    """Saare LIVE whale positions (latest w snapshot) ko price-zones (SR_ZONE chaudi) me cluster
+    karo -- alag LONG entries alag, alag SHORT entries alag, $usd-weighted. Jahan LONG entries ka
+    sabse bada cluster hai wahi un whales ka "defend karne wala" support zone hai (wahan unka average
+    cost-basis hai); SHORT entries ka sabse bada cluster resistance. Ye REAL entry-price data hai jo
+    exchange khud deta hai, kisi indicator ka guess nahi."""
+    rows = con.execute("SELECT szi,entry,usd FROM w WHERE ts=(SELECT MAX(ts) FROM w) AND entry IS NOT NULL").fetchall()
+    if not rows:
+        return None
+    zone_of = lambda p: round(p / SR_ZONE) * SR_ZONE
+    longs, shorts = collections.defaultdict(float), collections.defaultdict(float)
+    for szi, entry, usd in rows:
+        if not usd:
+            continue
+        z = zone_of(entry)
+        (longs if szi > 0 else shorts)[z] += usd
+    top_longs = sorted(longs.items(), key=lambda kv: -kv[1])[:3]
+    top_shorts = sorted(shorts.items(), key=lambda kv: -kv[1])[:3]
+    return {"long_entry_zones": top_longs, "short_entry_zones": top_shorts}
+
+
+def whale_liq_clusters(con):
+    """Saare LIVE whale positions ke LIQ price ko bhi price-zones me cluster karo, $usd-weighted,
+    LONG-liq aur SHORT-liq alag alag. Jahan bahut saare LONG liqs ek zone me jama hain, wahan agar
+    price pahunchi to EK saath kai forced-sell market-orders fire hone ka risk hai -- cascade zone.
+    SACH: ye batata hai KAHAN cascade ho sakta hai agar price wahan pahunche, ye guarantee nahi ki
+    price wahan jayegi hi -- sirf 'agar jaaye to kya hoga' ka structural map hai."""
+    rows = con.execute("SELECT szi,liq,usd FROM w WHERE ts=(SELECT MAX(ts) FROM w) AND liq IS NOT NULL AND liq>0").fetchall()
+    if not rows:
+        return None
+    zone_of = lambda p: round(p / SR_ZONE) * SR_ZONE
+    long_liq, short_liq = collections.defaultdict(float), collections.defaultdict(float)
+    for szi, liq, usd in rows:
+        if not usd:
+            continue
+        z = zone_of(liq)
+        (long_liq if szi > 0 else short_liq)[z] += usd
+    top_long_liq = sorted(long_liq.items(), key=lambda kv: -kv[1])[:3]   # neeche cascade zones
+    top_short_liq = sorted(short_liq.items(), key=lambda kv: -kv[1])[:3]  # upar cascade zones
+    return {"long_liq_zones": top_long_liq, "short_liq_zones": top_short_liq}
+
+
+def retail_trap_check(con):
+    """Top-traders (bade/smart wallets) ka long/short ratio vs retail ka long/short ratio compare
+    karo -- dono Binance ke public ratio-endpoints se seedha aate hain, koi derived guess nahi. Jab
+    retail bahut zyada ek taraf jhuke hon (>1.5x ya <0.67x) aur top-traders uससe kaafi alag/opposite
+    hon, wahi classic 'retail trapped' zone hoti hai -- retail jis taraf heavy hai, market usi ko
+    squeeze karne jaata hai aksar."""
+    L = {k: v for k, (v, ts) in latest(con).items()}
+    top = L.get(("binance", "top_pos_ls"))
+    retail = L.get(("binance", "retail_ls"))
+    if top is None or retail is None or retail <= 0:
+        return None
+    retail_heavy_long = retail > 1.5
+    retail_heavy_short = retail < 0.67
+    diverge = top is not None and (
+        (retail_heavy_long and top < retail * 0.8) or
+        (retail_heavy_short and top > retail * 1.25))
+    trapped_side = None
+    if diverge:
+        trapped_side = "LONG" if retail_heavy_long else "SHORT"
+    return {"top_ls": top, "retail_ls": retail, "trapped_side": trapped_side}
+
+
+def exhaustion_check(con, now):
+    """'Taaqat khatam ho rahi hai kya' detector. Jab abhi ek taraf (jaise SELLERS BHAARI) pressure
+    chal raha hai, ye 4 ALAG real-measured cheezein check karta hai taaki pata chale us pressure ka
+    MOMENTUM fade ho raha hai ya nahi -- matlab 'yahan se bina kisi NAYE bade player ke is move mein
+    aur dum nahi lag raha':
+      1. big_buy/big_sell ka recent flow -- pichhle 2 periods me ghat raha hai kya (period-wise data,
+         cumulative nahi, isliye genuinely comparable)
+      2. order-book ka defending wall (jis side push ho raha uske OPPOSITE) khada hai ya khisak gaya
+      3. sabse bada khiladi: uska 1hr trend abhi bhi badh raha hai, PAR 15min (sabse fresh) me building
+         ruk gayi -- matlab uski apni speed abhi slow ho rahi hai (confirm nahi ki ruk gaya, sirf slow)
+      4. retail already capitulate kar chuka (retail_trap_check se, isi direction mein heavy)
+    SACH: 'exhaustion' ka matlab REVERSAL CONFIRM nahi hai -- sirf itna hai ki jo pressure chal raha
+    hai, uska momentum fresh/strong nahi lag raha abhi. Price flat/sideways bhi reh sakti hai, upar
+    bhi nahi jaani zaroori. Koi guarantee nahi, sirf ek extra caution-flag hai."""
+    bsp = buy_sell_pressure(con)
+    if not bsp:
+        return None
+    buy, sell, pct = bsp
+    dominant = "SELL" if pct < 50 else "BUY"
+    signals = []
+
+    flow_key = "big_sell_usd" if dominant == "SELL" else "big_buy_usd"
+    rows = con.execute("SELECT v FROM m WHERE src='hyperliquid' AND k=? ORDER BY ts DESC LIMIT 3",
+                       (flow_key,)).fetchall()
+    if len(rows) == 3:
+        v0, v1, v2 = rows[0][0], rows[1][0], rows[2][0]
+        if v0 < v1 and v1 <= v2:
+            signals.append("%s-flow pichhle 2 intervals me fade ho raha hai ($%.0f -> $%.0f -> $%.0f)" % (dominant, v2, v1, v0))
+
+    ww = wall_watch(con, now)
+    if ww:
+        defend_side = "bid" if dominant == "SELL" else "ask"
+        d = ww.get(defend_side)
+        if d and d[0] == "ABHI BHI KHADA HAI":
+            signals.append("%s wall abhi bhi khada hai (absorb ho raha, khisak nahi raha)" % defend_side.upper())
+
+    bp = biggest_player(con, now)
+    if bp:
+        bp_matches = (bp["side"] == "SHORT" and dominant == "SELL") or (bp["side"] == "LONG" and dominant == "BUY")
+        t15, t1h = bp["trend"].get("15min"), bp["trend"].get("1hr")
+        if bp_matches and t15 is not None and t1h is not None and t1h > 3 and t15 <= 1:
+            signals.append("sabse bada khiladi (%s) ka 1hr trend abhi bhi +%.1f%% hai, par 15min (sabse fresh) me building ruk gayi (%+.1f%%)" %
+                           (bp["side"], t1h, t15))
+
+    trap = retail_trap_check(con)
+    if trap:
+        retail_dir = "SHORT" if trap["retail_ls"] < 0.67 else "LONG" if trap["retail_ls"] > 1.5 else None
+        if retail_dir and ((retail_dir == "SHORT" and dominant == "SELL") or (retail_dir == "LONG" and dominant == "BUY")):
+            signals.append("retail bhi already %s-heavy hai (L/S %.2f) -- capitulation jaisa dikh raha" % (retail_dir, trap["retail_ls"]))
+
+    return {"dominant": dominant, "pct": pct, "signals": signals, "exhausted": len(signals) >= 2}
+
+
+def smart_money_playbook(con, now):
+    """Sab signals ek jagah milake 2 alag horizon ke liye verdict banata hai:
+      SCALP  (15min-1hr) -- wick-hunt + order-book walls + 1hr trendline + immediate bias
+      SWING  (4hr+)       -- biggest-player ka position-trend + 4hr/24hr trendline + weekly whale net flow
+    Har horizon me: direction, kitne signals agree kar rahe (confidence), entry-zone (whale entry
+    cluster), invalidation (nearest whale-liq cluster opposite side), aur retail-trap warning alag se.
+    SACH: ye sab existing real signals ka COMBINATION/confluence-count hai -- naya prediction-engine
+    nahi, sirf jo pehle se alag-alag boxes me tha use ek jagah jodta hai taaki clash/confluence saaf dikhe."""
+    px = current_mark(con)
+    if px is None:
+        return None
+    sc, bias_label, _ = bias_calc(con, now)
+    conv = whale_conviction(con)
+    press_long = sum((x[2] or 0) for x in conv if x[3] == "PRESSING LONG")
+    press_short = sum((x[2] or 0) for x in conv if x[3] == "PRESSING SHORT")
+    wh = wick_hunt_check(con, now)
+    bp = biggest_player(con, now)
+    lv = whale_levels(con)
+    liqc = whale_liq_clusters(con)
+    trap = retail_trap_check(con)
+
+    def nearest(zones, above):
+        cands = [z for z, u in (zones or []) if (z > px) == above]
+        return min(cands, key=lambda z: abs(z - px)) if cands else None
+
+    def zones_for(direction):
+        # entry_zone = isi direction ke whales ka entry-cluster (support/resistance, jahan unka cost-basis hai)
+        # target_zone = OPPOSITE side ka liq-cluster, trade ki favorable direction me -- agar price wahan
+        #   pahunchi to un opposite-wale whales ka forced-close hoga, jo isi direction me price ko aur dhakka dega
+        # invalid_zone = ISI direction (apne side) ka liq-cluster -- agar price wahan pahunch gayi, matlab
+        #   isi cohort ke whales flush ho rahe hain, thesis fail maano
+        if direction == "LONG":
+            entry_zone = nearest(lv["long_entry_zones"] if lv else None, False)
+            target_zone = nearest(liqc["short_liq_zones"] if liqc else None, True)
+            invalid_zone = nearest(liqc["long_liq_zones"] if liqc else None, False)
+        else:
+            entry_zone = nearest(lv["short_entry_zones"] if lv else None, True)
+            target_zone = nearest(liqc["long_liq_zones"] if liqc else None, False)
+            invalid_zone = nearest(liqc["short_liq_zones"] if liqc else None, True)
+        return entry_zone, target_zone, invalid_zone
+
+    out = {"px": px, "trap": trap}
+
+    # ---------- SCALP (15min-1hr) ----------
+    sc_votes, sc_reasons = 0, []
+    sc_dir = None
+    if wh and wh["aligned"]:
+        sc_dir = "LONG" if wh["expect_dir"] == "UP" else "SHORT"
+        sc_votes += 1
+        sc_reasons.append("wick-hunt (%s, %s taraf)" % (wh["kind"], wh["expect_dir"]))
+    if abs(sc) > 1.0:
+        d2 = "LONG" if sc > 0 else "SHORT"
+        if sc_dir is None:
+            sc_dir = d2
+        if d2 == sc_dir:
+            sc_votes += 1
+            sc_reasons.append("immediate bias %s (%+.1f)" % (bias_label, sc))
+    if sc_dir:
+        entry_zone, target_zone, invalid_zone = zones_for(sc_dir)
+        out["scalp"] = {"dir": sc_dir, "votes": sc_votes, "reasons": sc_reasons,
+                         "entry_zone": entry_zone, "target_zone": target_zone, "invalid_zone": invalid_zone}
+    else:
+        out["scalp"] = None
+
+    # ---------- SWING (4hr+) ----------
+    sw_votes, sw_reasons = 0, []
+    sw_dir = None
+    if bp and bp["trend"].get("4hr") is not None:
+        if bp["trend"]["4hr"] > 3:
+            sw_dir = bp["side"]
+            sw_reasons.append("sabse bada khiladi (%s) apna size 4hr me +%.1f%% badha raha" % (bp["side"], bp["trend"]["4hr"]))
+            sw_votes += 1
+        elif bp["trend"]["4hr"] < -3:
+            # badha hua khiladi unwind kar raha hai -- isse koi fresh direction vote nahi milta
+            # (uska apna exit hai, naya conviction nahi), sirf context ke liye reason me note karte hain
+            sw_reasons.append("SACH context: sabse bada khiladi (%s) apna size 4hr me %.1f%% ghata raha (unwind, iska fresh-direction vote nahi)" %
+                              (bp["side"], bp["trend"]["4hr"]))
+    if press_long > 0 or press_short > 0:
+        d2 = "LONG" if press_long >= press_short * 1.3 else "SHORT" if press_short >= press_long * 1.3 else None
+        if d2:
+            if sw_dir is None:
+                sw_dir = d2
+            if d2 == sw_dir:
+                sw_votes += 1
+                sw_reasons.append("whale conviction overall bhi %s taraf" % d2)
+    if sw_dir:
+        entry_zone, target_zone, invalid_zone = zones_for(sw_dir)
+        out["swing"] = {"dir": sw_dir, "votes": sw_votes, "reasons": sw_reasons,
+                         "entry_zone": entry_zone, "target_zone": target_zone, "invalid_zone": invalid_zone}
+    else:
+        out["swing"] = None
+
+    return out
+
+
+def master_verdict(con, now):
+    """SAB signals (wick-hunt, exhaustion-check, smart-money-playbook scalp+swing) ko ek jagah
+    milake EK top headline banata hai -- taaki alag-alag boxes padhke khud confluence nikaalne ki
+    zaroorat na pade.
+
+    FAKE WICK-HUNT SE BACHAV: wick_hunt_check() khud hi sirf confirmed-retrace + bias/whale-alignment
+    pe trigger hota hai (raw spike pe nahi) -- par yahan ek extra cross-check bhi karte hain: agar
+    wick-hunt 'X taraf move aayega' keh raha hai (matlab opposite side abhi exhaust hona chahiye),
+    aur exhaustion_check khud us opposite side ko 'abhi bhi FRESH/strong' bata raha hai (exhausted
+    nahi), toh DONO signals CONTRADICT kar rahe hain -- is case me hum CONFIDENT verdict nahi dete,
+    'MIXED, wait karo' bolte hain. Jab dono AGREE karte hain, tabhi extra weight milta hai.
+
+    SACH: ye bhi existing signals ka combination hai, naya prediction-engine nahi. 'Confidence' sirf
+    kitne signals agree karte hain uska count hai, statistically validated probability nahi."""
+    smp = smart_money_playbook(con, now)
+    if not smp:
+        return None
+    wh = wick_hunt_check(con, now)
+    exh = exhaustion_check(con, now)
+
+    votes = {"LONG": 0.0, "SHORT": 0.0}
+    reasons = {"LONG": [], "SHORT": []}
+    conflict = []
+
+    if wh and wh["aligned"]:
+        wdir = "LONG" if wh["expect_dir"] == "UP" else "SHORT"
+        opp_dominant = "SELL" if wdir == "LONG" else "BUY"  # jis side exhaust hona chahiye isi wick-hunt ko support karne ke liye
+        if exh and exh["dominant"] == opp_dominant and exh["exhausted"]:
+            votes[wdir] += 1.5
+            reasons[wdir].append("wick-hunt + exhaustion-check DONO confirm (%s side momentum khatam lag raha)" % opp_dominant)
+        elif exh and exh["dominant"] == opp_dominant and not exh["exhausted"]:
+            conflict.append("wick-hunt %s expect kar raha, PAR exhaustion-check kehta hai %s side abhi bhi fresh/strong hai -- CONTRADICT, is wick-hunt pe akela bharosa mat karo" %
+                            (wdir, opp_dominant))
+        else:
+            votes[wdir] += 0.7
+            reasons[wdir].append("wick-hunt (%s) -- exhaustion-check se cross-check nahi mil paya, standalone signal" % wh["kind"])
+
+    for key in ("scalp", "swing"):
+        d = smp.get(key)
+        if d:
+            votes[d["dir"]] += d["votes"] * 0.5
+            reasons[d["dir"]].append("%s confluence: %s" % (key.upper(), "; ".join(d["reasons"])))
+
+    final_dir = None
+    if votes["LONG"] >= 1.2 and votes["LONG"] > votes["SHORT"]:
+        final_dir = "LONG"
+    elif votes["SHORT"] >= 1.2 and votes["SHORT"] > votes["LONG"]:
+        final_dir = "SHORT"
+
+    return {"dir": final_dir, "score_long": votes["LONG"], "score_short": votes["SHORT"],
+            "reasons": reasons.get(final_dir, []) if final_dir else [],
+            "conflict": conflict, "trap": smp["trap"], "exh": exh}
 
 
 def entry_radar(con):
@@ -683,9 +998,31 @@ def render():
     colmap = {"BULLISH": "#1b7a3a", "BEARISH": "#b02a2a", "NEUTRAL": "#555"}
 
     rows_html = []
+    detail_html = []   # raw/deep-detail boxes -- collapsible section, bottom of page
     rows_html.append("<div class='price'>BTC $%s</div>" % (("%.0f" % mark) if mark else "--"))
     if stale:
         rows_html.append("<div class='warn'>DATA %.0f MIN PURANA -- collector check karo</div>" % (data_age / 60))
+
+    mv = master_verdict(con, now)
+    if mv:
+        lines = ["<div class='hdr' style='color:#ccc'>📋 MASTER VERDICT (sab signals ek jagah -- wick-hunt cross-checked exhaustion se)</div>"]
+        if mv["conflict"]:
+            for cftext in mv["conflict"]:
+                lines.append("<div class='small' style='color:#fbbf24'>⚠ %s</div>" % esc(cftext))
+        if mv["dir"]:
+            dcol = "#4ade80" if mv["dir"] == "LONG" else "#f87171"
+            lines.append("<div style='font-size:19px;font-weight:700;color:%s;margin-top:4px'>%s (score %.1f vs %.1f)</div>" %
+                         (dcol, mv["dir"], mv["score_long"] if mv["dir"] == "LONG" else mv["score_short"],
+                          mv["score_short"] if mv["dir"] == "LONG" else mv["score_long"]))
+            lines.append("<div class='small'>Kyun: " + esc("; ".join(mv["reasons"])) + "</div>")
+        else:
+            lines.append("<div class='small' style='color:#888;margin-top:4px'>Abhi koi clean consolidated direction nahi -- "
+                         "signals mixed/weak hain ya contradict kar rahe. Wait karo.</div>")
+        if mv["trap"] and mv["trap"]["trapped_side"]:
+            lines.append("<div class='small' style='color:#fbbf24;margin-top:4px'>⚠ Retail %s-heavy hai, top-traders alag hain -- trap-risk.</div>" % mv["trap"]["trapped_side"])
+        lines.append("<div class='small' style='color:#666;margin-top:6px'>SACH: ye niche ke detail-boxes (wick-hunt, exhaustion, smart-money-playbook) ka COMBINATION hai, "
+                     "alag se koi naya prediction nahi. Confidence = kitne signal agree kiye, statistically-proven probability nahi. Backtest abhi nahi hua.</div>")
+        rows_html.append("<div class='box' style='border:2px solid #8b5cf6;background:#1a1a2e'>" + "".join(lines) + "</div>")
 
     wh = wick_hunt_check(con, now)
     if wh and wh["aligned"]:
@@ -697,6 +1034,37 @@ def render():
             "<div class='small' style='margin-top:4px'>%s</div>"
             "<div class='small' style='color:#666;margin-top:4px'>SACH: heuristic hai, guarantee nahi -- wick hui iska matlab move pakka nahi.</div>"
             "</div>" % (wcol, wcol, wcol, wh["kind"], wh["spike"], wh["retrace"], wh["expect_dir"], esc("; ".join(wh["supports"]))))
+
+    smp = smart_money_playbook(con, now)
+    if smp:
+        lines = ["<div class='hdr'>🧠 SMART MONEY PLAYBOOK (whale entry/liq-cluster + confluence, SCALP vs SWING)</div>"]
+        if smp["trap"] and smp["trap"]["trapped_side"]:
+            t = smp["trap"]
+            lines.append("<div class='small' style='color:#fbbf24'>⚠ RETAIL TRAP RISK: retail %s-heavy hai (L/S %.2f) jabki top-traders utne nahi (%.2f) -- "
+                          "agar iss trade me retail ki crowd follow kar rahe ho, careful raho.</div>" %
+                         (t["trapped_side"], t["retail_ls"], t["top_ls"]))
+        for horizon, key, lbl in (("scalp", "scalp", "SCALP (15min-1hr)"), ("swing", "swing", "SWING (4hr+)")):
+            d = smp.get(key)
+            if not d:
+                lines.append("<div class='small' style='margin-top:6px;color:#666'>%s: abhi koi clean signal nahi (confluence nahi mila)</div>" % lbl)
+                continue
+            dcol = "#4ade80" if d["dir"] == "LONG" else "#f87171"
+            lines.append("<div style='margin-top:8px'><b>%s</b> -- <span style='color:%s;font-weight:700'>%s</span> (%d signal(s) agree)</div>" %
+                         (lbl, dcol, d["dir"], d["votes"]))
+            lines.append("<div class='small'>Kyun: " + esc("; ".join(d["reasons"])) + "</div>")
+            zparts = []
+            if d["entry_zone"]:
+                zparts.append("entry-zone (whale cost-basis) ~$%.0f" % d["entry_zone"])
+            if d["target_zone"]:
+                zparts.append("<span style='color:#4ade80'>target/squeeze-zone ~$%.0f</span>" % d["target_zone"])
+            if d["invalid_zone"]:
+                zparts.append("<span style='color:#f87171'>invalidation-zone ~$%.0f</span>" % d["invalid_zone"])
+            if zparts:
+                lines.append("<div class='small' style='margin-top:2px'>" + " | ".join(zparts) + "</div>")
+        lines.append("<div class='small' style='color:#666;margin-top:6px'>SACH: entry/target/invalid zones whale entry-price aur LIQ-price ke REAL clusters hain (exchange data se) -- "
+                     "'target' ka matlab guarantee nahi, sirf structural zone hai jahan opposite-side whales flush ho sakte hain aur move accelerate ho sakta hai. "
+                     "'invalid' zone pe pahunchna matlab isi cohort ke whales flush ho rahe, thesis fail maano. Backtested nahi hai abhi.</div>")
+        rows_html.append("<div class='box' style='border:1px solid #8b5cf6'>" + "".join(lines) + "</div>")
 
     bsp = buy_sell_pressure(con)
     if bsp:
@@ -713,6 +1081,22 @@ def render():
             "<div class='small'>BUY $%.1fM (%.0f%%) &nbsp;vs&nbsp; SELL $%.1fM (%.0f%%)</div>"
             "<div style='font-weight:700;color:%s;margin-top:2px'>%s</div>"
             "</div>" % (pct, 100 - pct, buy / 1e6, pct, sell / 1e6, 100 - pct, hcol, heavier))
+
+        exh = exhaustion_check(con, now)
+        if exh and len(exh["signals"]) > 0:
+            ecol = "#fbbf24" if exh["exhausted"] else "#666"
+            etitle = ("⚖ %s PRESSURE EXHAUST HO RAHA LAG RAHA HAI (%d/4 signals)" % (exh["dominant"], len(exh["signals"]))) if exh["exhausted"] \
+                     else ("⚖ EXHAUSTION CHECK -- abhi sirf %d/4 signal, confirm nahi" % len(exh["signals"]))
+            lines = ["<div class='hdr' style='color:%s'>%s</div>" % (ecol, etitle)]
+            for s in exh["signals"]:
+                lines.append("<div class='small'>- %s</div>" % esc(s))
+            if exh["exhausted"]:
+                lines.append("<div class='small' style='margin-top:4px'>Matlab: %s side ka momentum abhi FRESH/STRONG nahi lag raha -- "
+                              "agar isi taraf trade mein ho, yahan se bina kisi NAYE bade player/confirmation ke zyada aggressive mat ho, "
+                              "existing trade pe risk tighten karna soch sakte ho.</div>" % exh["dominant"])
+            lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: ye REVERSAL CONFIRM nahi karta -- sirf itna batata hai ki "
+                         "momentum fresh nahi lag raha. Price flat bhi reh sakti hai, ulti taraf jaana zaroori nahi.</div>")
+            rows_html.append("<div class='box' style='border:1px solid %s'>" % ecol + "".join(lines) + "</div>")
 
     L2 = latest(con)
     g2 = lambda s, k: (L2[(s, k)][0] if (s, k) in L2 else None)
@@ -731,6 +1115,13 @@ def render():
                              (side.upper(), status, u0 / 1e6, u1 / 1e6))
         else:
             lines.append("<div class='small' style='color:#666'>(history ke liye abhi kam data hai)</div>")
+        sp = spoof_check(con, now)
+        if sp:
+            for e in sp:
+                lines.append("<div class='small' style='color:#fbbf24;margin-top:4px'>⚠ POSSIBLE SPOOF (%s): $%.0f pe $%.2fM wala wall "
+                             "achanak $%.2fM reh gaya, bina matching trade-volume ke ($%.0f hi hua) -- lagta hai order EXECUTE nahi hua, "
+                             "CANCEL kiya gaya tha</div>" % (e["side"].upper(), e["px"], e["was_usd"] / 1e6, e["now_usd"] / 1e6, e["matching_vol"]))
+            lines.append("<div class='small' style='color:#666;margin-top:2px'>SACH: sirf har ~30sec ka poll hai -- isse fast (ms-level) spoofing bilkul nahi dikhegi, sirf slower-type.</div>")
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     bc = breakout_check(con, now)
@@ -833,16 +1224,16 @@ def render():
             cls = "up" if side == "BULL" else "dn"
             lines.append("<div class='ev %s'>%s <b>%s</b> %s %s -- %s</div>" %
                          (cls, time.strftime("%H:%M", time.localtime(ts)), venue, kind, side, esc(note)))
-        rows_html.append("<div class='box'><div class='hdr'>Pichhle 30 min events</div>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'><div class='hdr'>Pichhle 30 min events</div>" + "".join(lines) + "</div>")
     else:
-        rows_html.append("<div class='box small'>Pichhle 30 min me koi event nahi</div>")
+        detail_html.append("<div class='box small'>Pichhle 30 min me koi event nahi</div>")
 
     cw = q(con, "SELECT addr,label,bought,sold FROM c WHERE ts=(SELECT MAX(ts) FROM c) ORDER BY (bought+sold) DESC LIMIT 6")
     if cw:
         lines = ["<div class='hdr'>Hyperliquid wallets</div>"]
         for a, lab, b_, s_ in cw:
             lines.append("<div class='wrow'>%s..%s <b>%s</b> B $%.1fM / S $%.1fM</div>" % (a[:6], a[-4:], lab, b_ / 1e6, s_ / 1e6))
-        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     bp = biggest_player(con, now)
     if bp:
@@ -890,7 +1281,7 @@ def render():
                 base += " -- <span style='color:#f87171'>LIQ $%.0f</span>%s" % (liq, dist_txt)
             lines.append(base + "</div>")
         lines.append("<div class='small' style='color:#666;margin-top:4px'>LIQ = jahan ye position forced-close hogi -- us point pe exchange khud market order fire karta hai, jo price ko us hi disha me aur dhakka de sakta hai (cascade ka risk).</div>")
-        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     conv = whale_conviction(con)
     if conv:
@@ -900,7 +1291,7 @@ def render():
         uniq = len(set(x[0] for x in conv))
         if uniq < 3:
             lines.append("<div class='small' style='color:#f59e0b'>SAVDHAN: sirf %d alag wallet(s) se, 'market' mat samjho, chhota sample</div>" % uniq)
-        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     radar = entry_radar(con)
     if radar:
@@ -909,7 +1300,7 @@ def render():
             cls = "up" if net > 0 else "dn" if net < 0 else ""
             dirn = "GHUS RAHA (buy)" if net > 0 else "NIKAL/SHORT (sell)" if net < 0 else "balanced"
             lines.append("<div class='wrow %s'>%s (%d wallets) net %+.0f -> %s</div>" % (cls, name, n, net, dirn))
-        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     plan = trade_plan(con, now)
     if plan:
@@ -928,7 +1319,7 @@ def render():
                     lines.append("<div class='small'>$%.0f : up %.0f%% / down %.0f%% (%d touch)</div>" %
                                  (z, st["up"] / st["touch"] * 100, st["down"] / st["touch"] * 100, st["touch"]))
             lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: 1-2 din ka data, backtest nahi hua. Blindly order mat daalo.</div>")
-        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     pw = pig_vs_whale(con)
     if pw:
@@ -946,7 +1337,7 @@ def render():
                 lines.append("<div class='small'>Whale net flow: %+.0f USD</div>" % whale_net)
         if diverge:
             lines.append("<div class='small' style='color:#f59e0b;margin-top:4px'>PIG aur WHALE ulti disha me hain -- dhyan layak, proof nahi</div>")
-        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     tr, total_setups = track_record(con)
     lines = ["<div class='hdr'>Track record (3+ wallet confluence, khud test)</div>"]
@@ -960,7 +1351,11 @@ def render():
                 warn = " -- bahut kam sample" if n < 20 else ""
                 lines.append("<div class='small'>%s: %d HIT / %d MISS / %d FLAT (%d eval, %.0f%% hit)%s</div>" % (win, h, m, fl, n, h / n * 100, warn))
         lines.append("<div class='small' style='color:#666'>total setups log hue: %d</div>" % total_setups)
-    rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+    detail_html.append("<div class='box'>" + "".join(lines) + "</div>")
+
+    if detail_html:
+        rows_html.append("<details class='detail'><summary>Zyada detail / raw data (%d boxes) -- click karo</summary>"
+                         "<div class='detail-inner'>" % len(detail_html) + "".join(detail_html) + "</div></details>")
 
     con.close()
     return "\n".join(rows_html), stale
@@ -970,21 +1365,32 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Footprint Live</title>
 <style>
-body{background:#0b0b0f;color:#eee;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:12px;max-width:1400px}
-#app{column-width:440px;column-gap:18px}
-.price{font-size:30px;font-weight:700;margin:4px 0 10px 0;break-inside:avoid;-webkit-column-break-inside:avoid}
-.warn{background:#b02a2a;padding:6px 10px;border-radius:6px;margin-bottom:10px;font-size:13px;break-inside:avoid;-webkit-column-break-inside:avoid}
-.bias{padding:10px 12px;border-radius:8px;margin-bottom:10px;line-height:1.5;break-inside:avoid;-webkit-column-break-inside:avoid}
-.box{background:#17171c;border-radius:8px;padding:10px 12px;margin-bottom:10px;break-inside:avoid;-webkit-column-break-inside:avoid}
-.hdr{color:#888;font-size:12px;text-transform:uppercase;margin-bottom:6px}
-.small{font-size:12px;opacity:.85}
-.ev{font-size:13px;padding:3px 0;border-bottom:1px solid #222}
+*{box-sizing:border-box}
+body{background:#0a0a0d;color:#e5e5e5;font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:16px;max-width:1400px}
+#app{column-width:420px;column-gap:16px}
+.price{font-size:28px;font-weight:700;margin:2px 0 12px 0;letter-spacing:-.5px;break-inside:avoid;-webkit-column-break-inside:avoid}
+.warn{background:#7f1d1d;padding:8px 12px;border-radius:8px;margin-bottom:10px;font-size:13px;break-inside:avoid;-webkit-column-break-inside:avoid}
+.bias{padding:10px 12px;border-radius:8px;margin-bottom:10px;line-height:1.5;break-inside:avoid;-webkit-column-break-inside:avoid;font-size:13px}
+.box{background:#151518;border:1px solid #232328;border-radius:10px;padding:11px 13px;margin-bottom:12px;break-inside:avoid;-webkit-column-break-inside:avoid}
+.box.primary{background:#17171d;padding:13px 15px}
+.hdr{color:#8a8a93;font-size:11px;text-transform:uppercase;letter-spacing:.4px;margin-bottom:7px;font-weight:600}
+.small{font-size:12px;opacity:.82;line-height:1.45}
+.ev{font-size:12.5px;padding:3px 0;border-bottom:1px solid #1e1e22}
 .ev.up{color:#4ade80}
 .ev.dn{color:#f87171}
-.wrow{font-size:13px;padding:3px 0}
+.wrow{font-size:12.5px;padding:2.5px 0}
 .wrow.up{color:#4ade80}
 .wrow.dn{color:#f87171}
-.foot{font-size:11px;color:#666;margin-top:12px;text-align:center}
+.up{color:#4ade80}
+.dn{color:#f87171}
+.foot{font-size:11px;color:#555;margin-top:16px;text-align:center}
+details.detail{column-span:all;margin-top:6px;padding-top:14px;border-top:1px solid #1e1e22}
+details.detail>summary{cursor:pointer;color:#777;font-size:12px;text-transform:uppercase;letter-spacing:.5px;padding:6px 0;list-style:none;user-select:none}
+details.detail>summary::-webkit-details-marker{display:none}
+details.detail>summary:before{content:"▸ ";color:#555}
+details.detail[open]>summary:before{content:"▾ "}
+details.detail>summary:hover{color:#aaa}
+.detail-inner{column-width:420px;column-gap:16px;margin-top:10px}
 </style></head>
 <body>
 <div id="app">Loading...</div>
