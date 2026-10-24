@@ -983,6 +983,41 @@ def plain_setup(con, now):
             "sl": sl, "tp": tp, "sl_pts": sl_pts, "tp_pts": tp_pts, "total_setups": total_setups}
 
 
+def plain_verdict(con, now):
+    """SABSE simple, EK-LINE jawab -- 'abhi ye karo' ya 'wait karo', plain bhasha mein, seedhe
+    points ke saath. Ye do ALAG system -- plain_setup() (jo whale-pressing+bias se SL/TP banata hai)
+    aur smart_money_playbook() (whale entry/liq-cluster wala) -- ko compare karta hai. DONO agree
+    karein tabhi confident number deta hai. Disagree karein toh 'mixed' jaisa vague nahi bolta --
+    EXACTLY batata hai kaun system kya bol raha hai, taaki samajh aaye confusion kyun hai."""
+    ps = plain_setup(con, now)
+    smp = smart_money_playbook(con, now)
+    ps_dir = ps.get("direction") if ps else None
+    smp_votes = {"LONG": 0, "SHORT": 0}
+    smp_which = {"LONG": [], "SHORT": []}
+    if smp:
+        for key in ("scalp", "swing"):
+            d = smp.get(key)
+            if d:
+                smp_votes[d["dir"]] += 1
+                smp_which[d["dir"]].append(key.upper())
+    smp_dir = "LONG" if smp_votes["LONG"] > smp_votes["SHORT"] else "SHORT" if smp_votes["SHORT"] > smp_votes["LONG"] else None
+
+    if ps_dir and smp_dir and ps_dir == smp_dir and ps.get("sl") is not None:
+        return {"state": "GO", "dir": ps_dir, "entry": ps["price"], "sl": ps["sl"], "sl_pts": ps["sl_pts"],
+                "tp": ps["tp"], "tp_pts": ps["tp_pts"], "conf": ps["conf"]}
+    if ps_dir and smp_dir and ps_dir == smp_dir and ps.get("sl") is None:
+        return {"state": "WAIT", "why": "dono system <b>%s</b> pe agree karte hain, PAR exact SL/TP abhi calculate nahi ho paya "
+                "(overall bias isse match nahi kar raha) -- direction pe confidence hai, par exact number nahi, thoda wait karo" % ps_dir}
+    if ps_dir and smp_dir and ps_dir != smp_dir:
+        return {"state": "WAIT", "why": "ek system (SIMPLE SETUP) <b>%s</b> bol raha hai, doosra (SMART MONEY, %s) <b>%s</b> bol raha hai -- dono alag disha, abhi confuse hai, trade mat lo" %
+                (ps_dir, "/".join(smp_which[smp_dir]), smp_dir)}
+    if ps_dir and not smp_dir:
+        return {"state": "WAIT", "why": "SIMPLE SETUP <b>%s</b> bol raha hai, par whale entry/liq-cluster system se koi confirm nahi mila -- akele signal pe bharosa risky hai" % ps_dir}
+    if not ps_dir and smp_dir:
+        return {"state": "WAIT", "why": "SMART MONEY PLAYBOOK <b>%s</b> (%s) bol raha hai, par overall bias/whale-pressing abhi utna clear nahi -- confirm nahi" % (smp_dir, "/".join(smp_which[smp_dir]))}
+    return {"state": "WAIT", "why": "abhi koi clean signal nahi bann raha kisi bhi system se"}
+
+
 def render():
     con = sqlite3.connect(DB)
     now = time.time()
@@ -1003,9 +1038,27 @@ def render():
     if stale:
         rows_html.append("<div class='warn'>DATA %.0f MIN PURANA -- collector check karo</div>" % (data_age / 60))
 
+    pv = plain_verdict(con, now)
+    if pv:
+        if pv["state"] == "GO":
+            dcol = "#4ade80" if pv["dir"] == "LONG" else "#f87171"
+            lines = ["<div class='hdr' style='color:#ccc'>🎯 YE KARO</div>",
+                     "<div style='font-size:24px;font-weight:800;color:%s'>%s lo abhi</div>" % (dcol, pv["dir"]),
+                     "<div style='font-size:15px;margin-top:6px'>Entry: <b>$%.0f</b> (abhi ka price)</div>" % pv["entry"],
+                     "<div style='font-size:15px;color:#f87171'>SL: $%.0f (%.0f points) -- yahan pahunche to nikal jao, loss accept karo</div>" % (pv["sl"], pv["sl_pts"]),
+                     "<div style='font-size:15px;color:#4ade80'>TP: $%.0f (%.0f points) -- yahan pahunche to profit book karo, nikal jao</div>" % (pv["tp"], pv["tp_pts"]),
+                     "<div class='small' style='margin-top:8px;color:#aaa'>Confidence: %s. Dono system (Simple Setup + Smart Money Playbook) agree karte hain.</div>" % pv["conf"],
+                     "<div class='small' style='color:#666;margin-top:4px'>SACH: ye guarantee nahi hai, sirf 2 system ka agreement hai. Har 15-30 min wapas check karo -- agar signal palat jaaye, SL hit hone se pehle bhi nikal sakte ho.</div>"]
+            rows_html.append("<div class='box' style='border:3px solid %s;background:#15201a'>" % dcol + "".join(lines) + "</div>")
+        else:
+            lines = ["<div class='hdr' style='color:#ccc'>🎯 YE KARO</div>",
+                     "<div style='font-size:22px;font-weight:800;color:#999'>ABHI WAIT KARO</div>",
+                     "<div class='small' style='margin-top:6px'>" + pv["why"] + "</div>"]
+            rows_html.append("<div class='box' style='border:3px solid #444;background:#17171a'>" + "".join(lines) + "</div>")
+
     mv = master_verdict(con, now)
     if mv:
-        lines = ["<div class='hdr' style='color:#ccc'>📋 MASTER VERDICT (sab signals ek jagah -- wick-hunt cross-checked exhaustion se)</div>"]
+        lines = ["<div class='hdr' style='color:#ccc'>📋 MASTER VERDICT (detail reasoning -- upar wale 'YE KARO' box ka backend)</div>"]
         if mv["conflict"]:
             for cftext in mv["conflict"]:
                 lines.append("<div class='small' style='color:#fbbf24'>⚠ %s</div>" % esc(cftext))
@@ -1020,9 +1073,9 @@ def render():
                          "signals mixed/weak hain ya contradict kar rahe. Wait karo.</div>")
         if mv["trap"] and mv["trap"]["trapped_side"]:
             lines.append("<div class='small' style='color:#fbbf24;margin-top:4px'>⚠ Retail %s-heavy hai, top-traders alag hain -- trap-risk.</div>" % mv["trap"]["trapped_side"])
-        lines.append("<div class='small' style='color:#666;margin-top:6px'>SACH: ye niche ke detail-boxes (wick-hunt, exhaustion, smart-money-playbook) ka COMBINATION hai, "
+        lines.append("<div class='small' style='color:#666;margin-top:6px'>SACH: ye wick-hunt, exhaustion, smart-money-playbook ka COMBINATION hai, "
                      "alag se koi naya prediction nahi. Confidence = kitne signal agree kiye, statistically-proven probability nahi. Backtest abhi nahi hua.</div>")
-        rows_html.append("<div class='box' style='border:2px solid #8b5cf6;background:#1a1a2e'>" + "".join(lines) + "</div>")
+        detail_html.append("<div class='box' style='border:1px solid #8b5cf6'>" + "".join(lines) + "</div>")
 
     wh = wick_hunt_check(con, now)
     if wh and wh["aligned"]:
@@ -1197,9 +1250,9 @@ def render():
         lines.append("<div class='small'>Entry ke BAAD: har 15-30 min isi page ko wapas check karte raho. Agar wahi whale(s) covering/exit dikhne lage ya naya PRESSING ulti taraf aa jaye, thesis khatam samjho -- SL hit hone se pehle bhi nikal sakte ho.</div>")
         warn = " -- isse bahut kam hai, abhi risk mat lena sirf isi pe" if ps["total_setups"] < 20 else ""
         lines.append("<div class='small' style='color:#666;margin-top:4px'>Humara apna track-record system abhi tak %d setups ne test kiya hai%s.</div>" % (ps["total_setups"], warn))
-        rows_html.append("<div class='box' style='border:1px solid %s'>" % confcol[ps["conf"]] + "".join(lines) + "</div>")
+        detail_html.append("<div class='box' style='border:1px solid %s'>" % confcol[ps["conf"]] + "".join(lines) + "</div>")
     else:
-        rows_html.append("<div class='box'><div class='hdr'>SIMPLE SETUP</div><div class='small'>Abhi koi clear setup nahi bun raha -- na whale pressing hai na bias strong hai. Wait karo.</div></div>")
+        detail_html.append("<div class='box'><div class='hdr'>SIMPLE SETUP</div><div class='small'>Abhi koi clear setup nahi bun raha -- na whale pressing hai na bias strong hai. Wait karo.</div></div>")
 
     rows_html.append("<div class='bias' style='background:%s'>FOOTPRINT BIAS: %s (score %+.1f)<br><span class='small'>%s</span><br><span class='small'>confidence LOW, weights untested</span></div>" %
                      (colmap.get(label, "#555"), label, sc, esc(", ".join(parts) if parts else "koi footprint nahi")))
