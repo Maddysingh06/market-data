@@ -199,3 +199,6 @@ ts,venue,kind,side,a,b,note
 1792843402,hyperliquid,BURST,BULL,731471.35455,-0.17360870000266004,wallet 0x36cd..d195 ne 1 min me $0.73M kharida (price -0 pts)
 1792843573,hyperliquid,BURST,BULL,550504.91298,9.454876809992129,wallet 0xe167..043d ne 1 min me $0.55M kharida (price +9 pts)
 1792843693,hyperliquid,BURST,BULL,564168.584,-11.442304349999176,wallet 0x36cd..d195 ne 1 min me $0.56M kharida (price -11 pts)
+1792844340,binance,ABSORB,BEAR,58.07599999999998,1.5,bhaari kharid 58 BTC par price nahi chadha (upar koi bech raha) (price +2 pts is 1 min me)
+1792844460,binance,ABSORB,BULL,44.252999999999965,26.39999999999418,bhaari bikri 44 BTC par price nahi gira (neeche koi le raha) (price +26 pts is 1 min me)
+1792844916,hyperliquid,BURST,BULL,535806.53768,-2.5,wallet 0xee0b..1bc7 ne 1 min me $0.54M kharida (price -2 pts)
