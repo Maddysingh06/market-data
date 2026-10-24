@@ -1019,7 +1019,8 @@ def plain_verdict(con, now):
 
 
 def render():
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=10)
+    con.execute("PRAGMA busy_timeout=10000")
     now = time.time()
     L = latest(con)
     g = lambda s, k: (L[(s, k)][0] if (s, k) in L else None)

@@ -283,7 +283,14 @@ SRC = {"binance": c_binance, "bybit": c_bybit, "okx": c_okx, "hyperliquid": c_hy
 
 # ------------- DB -------------
 def db():
-    con = sqlite3.connect(DB, check_same_thread=False)
+    con = sqlite3.connect(DB, check_same_thread=False, timeout=30)
+    # WAL mode -- dashboard (alag process) isi file ko PADHTA rehta hai jabki collector LIKHTA
+    # rehta hai; default rollback-journal mode mein ye dono ek doosre ko lock karte hain aur
+    # "database is locked" crash hota hai (jo abhi hua). WAL mode mein readers aur ek writer
+    # same time pe chal sakte hain, bina block kiye. busy_timeout extra safety hai -- agar kabhi
+    # lock phir bhi mile, turant crash hone ke bajaye 30sec tak retry karega.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute("CREATE TABLE IF NOT EXISTS m(ts INT, src TEXT, k TEXT, v REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS w(ts INT, addr TEXT, szi REAL, entry REAL, liq REAL, upnl REAL, lev REAL, usd REAL, flow REAL)")
     con.execute("CREATE TABLE IF NOT EXISTS e(ts INT, venue TEXT, kind TEXT, side TEXT, a REAL, b REAL, note TEXT)")
@@ -1456,33 +1463,44 @@ def run():
         print("TG_TOKEN/TG_CHAT set nahi, Telegram alerts OFF")
     while True:
         t0 = time.time()
-        ts = snapshot(con)
-        wh.flush_big(ts)
-        wh.flush_bursts()
-        tape_hl.scan(time.time())
-        tape_bn.scan(time.time())
-        if time.time() - last_state > STATE_EVERY:
-            wh.poll_state(ts)
-            last_state = time.time()
-        log_setup(con, time.time())
-        evaluate_setups(con, time.time())
-        log_factors(con, time.time())
-        evaluate_factors(con, time.time())
-        log_trendline(con, time.time())
-        evaluate_trendline(con, time.time())
-        sc, label, parts = bias_calc(con, time.time())
-        put(con, ts, "footprint", "bias_score", sc)
-        if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
-            last_bias_alert[0] = time.time()
-            tg_send("FOOTPRINT BIAS: %s (score %+.1f)\n%s\n(confidence LOW, weights untested)" % (label, sc, ", ".join(parts) if parts else "-"))
-        hunt = wick_hunt_check(con, time.time())
-        if hunt and hunt["aligned"] and (time.time() - last_wh_alert[0]) > WH_COOLDOWN:
-            last_wh_alert[0] = time.time()
-            msg = ("%s (~%.0f pts spike, %.0f pts wapas aa chuka hai) -- agar %s taraf tez move aana hai toh abhi ka time hai.\n%s\nSACH: heuristic hai, guarantee nahi." %
-                  (hunt["kind"], hunt["spike"], hunt["retrace"], hunt["expect_dir"], "; ".join(hunt["supports"])))
-            print("WICK HUNT ALERT: %s" % msg.replace("\n", " "), flush=True)
-            tg_send(msg)
-        con.commit()
+        try:
+            ts = snapshot(con)
+            wh.flush_big(ts)
+            wh.flush_bursts()
+            tape_hl.scan(time.time())
+            tape_bn.scan(time.time())
+            if time.time() - last_state > STATE_EVERY:
+                wh.poll_state(ts)
+                last_state = time.time()
+            log_setup(con, time.time())
+            evaluate_setups(con, time.time())
+            log_factors(con, time.time())
+            evaluate_factors(con, time.time())
+            log_trendline(con, time.time())
+            evaluate_trendline(con, time.time())
+            sc, label, parts = bias_calc(con, time.time())
+            put(con, ts, "footprint", "bias_score", sc)
+            if label != "NEUTRAL" and (time.time() - last_bias_alert[0]) > 900:
+                last_bias_alert[0] = time.time()
+                tg_send("FOOTPRINT BIAS: %s (score %+.1f)\n%s\n(confidence LOW, weights untested)" % (label, sc, ", ".join(parts) if parts else "-"))
+            hunt = wick_hunt_check(con, time.time())
+            if hunt and hunt["aligned"] and (time.time() - last_wh_alert[0]) > WH_COOLDOWN:
+                last_wh_alert[0] = time.time()
+                msg = ("%s (~%.0f pts spike, %.0f pts wapas aa chuka hai) -- agar %s taraf tez move aana hai toh abhi ka time hai.\n%s\nSACH: heuristic hai, guarantee nahi." %
+                      (hunt["kind"], hunt["spike"], hunt["retrace"], hunt["expect_dir"], "; ".join(hunt["supports"])))
+                print("WICK HUNT ALERT: %s" % msg.replace("\n", " "), flush=True)
+                tg_send(msg)
+            con.commit()
+        except Exception as e:
+            # SACH: pehle (jaise "database is locked") koi bhi error isi loop ko CRASH kar deta
+            # tha aur poora collector mar jaata tha (data stale ho jaata). Ab error sirf LOG hoga,
+            # loop agle cycle mein phir try karega -- single temporary glitch se poora collector
+            # nahi girna chahiye.
+            print("MAIN LOOP ERR (skip, retry agle cycle): %r" % e, flush=True)
+            try:
+                con.rollback()
+            except Exception:
+                pass
         time.sleep(max(1, EVERY - (time.time() - t0)))
 
 
