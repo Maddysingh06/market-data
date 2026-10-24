@@ -160,6 +160,46 @@ def whale_conviction(con):
     return out
 
 
+def biggest_player(con, now):
+    """Pure BTC (jo bhi wallets hum track kar rahe hain) me se SABSE BADA live position
+    (abs $ size se) dhoondo. Fir uske apne LIQ price se cascade-push direction nikalo,
+    aur uska APNA position-size history (w table se) dekh ke batao ki wo khilada
+    abhi size BADHA raha hai (pressing) ya GHATA raha hai (unwind/profit-booking) --
+    ye ek asli, measured trend hai (DB se compute), koi guess ya prediction nahi."""
+    row = con.execute(
+        "SELECT addr,szi,entry,liq,usd,upnl,lev FROM w WHERE ts=(SELECT MAX(ts) FROM w) "
+        "ORDER BY usd DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    addr, szi, entry, liq, usd, upnl, lev = row
+    if szi is None or usd is None:
+        return None
+    side = "LONG" if szi > 0 else "SHORT"
+    cur_px = current_mark(con)
+
+    push_dir, push_dist_pct = None, None
+    if liq and cur_px:
+        # LONG ka liq hamesha neeche hota hai (price girne se liquidate) -> cascade NICHE
+        # SHORT ka liq hamesha upar hota hai (price chadne se liquidate) -> cascade UPAR
+        push_dir = "NICHE" if side == "LONG" else "UPAR"
+        push_dist_pct = abs(cur_px - liq) / cur_px * 100
+
+    trend = {}
+    for label, secs in (("15min", 900), ("1hr", 3600), ("4hr", 14400)):
+        r = con.execute(
+            "SELECT usd FROM w WHERE addr=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+            (addr, now - secs)).fetchone()
+        if r and r[0]:
+            old_usd = r[0]
+            trend[label] = (usd - old_usd) / old_usd * 100
+        else:
+            trend[label] = None
+
+    return {"addr": addr, "side": side, "szi": szi, "entry": entry, "liq": liq,
+            "usd": usd, "upnl": upnl, "lev": lev, "cur_px": cur_px,
+            "push_dir": push_dir, "push_dist_pct": push_dist_pct, "trend": trend}
+
+
 def entry_radar(con):
     rows = con.execute("SELECT addr,label,bought,sold FROM c WHERE ts=(SELECT MAX(ts) FROM c)").fetchall()
     tiers = collections.defaultdict(lambda: {"buy": 0.0, "sell": 0.0, "n": 0})
@@ -802,6 +842,36 @@ def render():
         lines = ["<div class='hdr'>Hyperliquid wallets</div>"]
         for a, lab, b_, s_ in cw:
             lines.append("<div class='wrow'>%s..%s <b>%s</b> B $%.1fM / S $%.1fM</div>" % (a[:6], a[-4:], lab, b_ / 1e6, s_ / 1e6))
+        rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
+
+    bp = biggest_player(con, now)
+    if bp:
+        a, side, szi, entry, liq, usd, upnl = bp["addr"], bp["side"], bp["szi"], bp["entry"], bp["liq"], bp["usd"], bp["upnl"]
+        lines = ["<div class='hdr'>SABSE TAGDA KHILADI (single biggest live position)</div>"]
+        pnl_txt = ""
+        if upnl is not None:
+            pnl_cls = "up" if upnl >= 0 else "dn"
+            pnl_txt = " -- <span class='%s'>uPNL $%.0f</span>" % (pnl_cls, upnl)
+        lines.append("<div class='wrow'>%s..%s <b>%s</b> %.2f BTC @ %.0f ($%.1fM)%s</div>" %
+                     (a[:6], a[-4:], side, abs(szi), entry or 0, usd / 1e6, pnl_txt))
+        if bp["liq"] and bp["push_dir"]:
+            lines.append("<div class='small'>Agar ye liquidate hua, price <b>%s</b> ki taraf dhakka khayega (cascade) -- "
+                          "LIQ $%.0f (abhi se %.1f%% door)</div>" % (bp["push_dir"], bp["liq"], bp["push_dist_pct"]))
+        tparts = []
+        for label in ("15min", "1hr", "4hr"):
+            d = bp["trend"].get(label)
+            if d is None:
+                tparts.append("%s: data nahi" % label)
+            elif d > 3:
+                tparts.append("%s: <span class='up'>+%.1f%% BADH raha (pressing)</span>" % (label, d))
+            elif d < -3:
+                tparts.append("%s: <span class='dn'>%.1f%% GHAT raha (unwind/profit-booking)</span>" % (label, d))
+            else:
+                tparts.append("%s: ~flat" % label)
+        lines.append("<div class='small' style='margin-top:4px'>Size trend: " + " | ".join(tparts) + "</div>")
+        lines.append("<div class='small' style='color:#666;margin-top:4px'>SACH: 'kab exact profit-booking hogi' koi predict "
+                      "nahi kar sakta -- ye sirf ABHI TAK size badh raha hai ya ghat raha hai wahi dikha raha hai (real DB data se, "
+                      "guess nahi). Agar GHAT raha hai, matlab wo khilada already nikalna shuru kar chuka hai.</div>")
         rows_html.append("<div class='box'>" + "".join(lines) + "</div>")
 
     top = q(con, "SELECT addr,szi,entry,usd,liq FROM w WHERE ts=(SELECT MAX(ts) FROM w) ORDER BY usd DESC LIMIT 5")
