@@ -303,3 +303,6 @@ ts,venue,kind,side,a,b,note
 1793010930,hyperliquid,BURST,BULL,504345.98169,-23.215844830003334,wallet 0x5b5d..c060 ne 1 min me $0.50M kharida (price -23 pts)
 1793011411,hyperliquid,BURST,BULL,602416.34192,-35.05171667000104,wallet 0x36cd..d195 ne 1 min me $0.60M kharida (price -35 pts)
 1793011522,hyperliquid,BURST,BEAR,515080.07049,2.80388333000883,wallet 0x50b3..9f20 ne 1 min me $0.52M becha (price +3 pts)
+1793012292,hyperliquid,BURST,BULL,516921.09981,-20.89999999999418,wallet 0x36cd..d195 ne 1 min me $0.52M kharida (price -21 pts)
+1793012317,hyperliquid,BURST,BEAR,503770.89586,-35.70689855000819,wallet 0xa5d0..d7c5 ne 1 min me $0.50M becha (price -36 pts)
+1793012373,hyperliquid,BURST,BEAR,504494.14092,-32.46864493000612,wallet 0x0898..4cf9 ne 1 min me $0.50M becha (price -32 pts)
