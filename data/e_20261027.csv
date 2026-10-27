@@ -234,3 +234,6 @@ ts,venue,kind,side,a,b,note
 1793105520,hyperliquid,ABSORB,BEAR,62.40535999999998,-3.0,bhaari kharid 62 BTC par price nahi chadha (upar koi bech raha) (price -3 pts is 1 min me)
 1793105622,hyperliquid,BURST,BULL,551379.24336,14.645717389998026,wallet 0xcf3f..f95f ne 1 min me $0.55M kharida (price +15 pts)
 1793105700,binance,ABSORB,BEAR,301.6109999999996,-1.8999999999941792,bhaari kharid 302 BTC par price nahi chadha (upar koi bech raha) (price -2 pts is 1 min me)
+1793106091,hyperliquid,BURST,BEAR,515199.28205,-29.915601450004033,wallet 0x92a7..3fea ne 1 min me $0.52M becha (price -30 pts)
+1793106160,binance,SLICE,BEAR,1.488,44.69599999700274,8 trade x 0.1860 BTC har ~44.7s (bikri)
+1793106313,hyperliquid,BURST,BEAR,513693.5832,-63.29934782999044,wallet 0x3f5f..4d0b ne 1 min me $0.51M becha (price -63 pts)
