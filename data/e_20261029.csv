@@ -178,3 +178,6 @@ ts,venue,kind,side,a,b,note
 1793245500,hyperliquid,ABSORB,BEAR,101.12023000000005,8.0,bhaari kharid 101 BTC par price nahi chadha (upar koi bech raha) (price +8 pts is 1 min me)
 1793245681,hyperliquid,BURST,BULL,7989341.73967,30.05394928000169,wallet 0xc3ed..00dd ne 1 min me $7.99M kharida (price +30 pts)
 1793245877,hyperliquid,BURST,BULL,515940.72369,-20.14633333000529,wallet 0xb49f..8258 ne 1 min me $0.52M kharida (price -20 pts)
+1793246547,hyperliquid,BURST,BULL,501417.39732,2.9792711100017186,wallet 0x1f06..df41 ne 1 min me $0.50M kharida (price +3 pts)
+1793246718,hyperliquid,BURST,BULL,500618.82217,-27.342707400006475,wallet 0x6fbb..e3bc ne 1 min me $0.50M kharida (price -27 pts)
+1793246774,hyperliquid,BURST,BEAR,531984.24558,35.55252624000423,wallet 0x7894..a5f7 ne 1 min me $0.53M becha (price +36 pts)
