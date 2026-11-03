@@ -579,3 +579,8 @@ ts,venue,kind,side,a,b,note
 1793731020,hyperliquid,ABSORB,BULL,51.23946999999998,-1.0,bhaari bikri 51 BTC par price nahi gira (neeche koi le raha) (price -1 pts is 1 min me)
 1793731086,hyperliquid,BURST,BULL,500953.93262000004,-40.60000000000582,wallet 0xa399..6a52 ne 1 min me $0.50M kharida (price -41 pts)
 1793731717,hyperliquid,BURST,BEAR,523611.46950999997,11.395262370002456,wallet 0x1367..560e ne 1 min me $0.52M becha (price +11 pts)
+1793731732,hyperliquid,BURST,BEAR,501054.10027,-62.97109570000612,wallet 0xf5d8..ad53 ne 1 min me $0.50M becha (price -63 pts)
+1793731796,hyperliquid,BURST,BULL,524891.8883999999,-10.924166669996339,wallet 0xcf3f..f95f ne 1 min me $0.52M kharida (price -11 pts)
+1793731934,hyperliquid,BURST,BEAR,864571.59788,-50.574514489999274,wallet 0x8923..1bac ne 1 min me $0.86M becha (price -51 pts)
+1793732032,hyperliquid,BURST,BEAR,776006.09453,0.25944203000108246,wallet 0x1367..560e ne 1 min me $0.78M becha (price +0 pts)
+1793732109,hyperliquid,BURST,BEAR,520150.9456,-9.271934779986623,wallet 0xcf3f..f95f ne 1 min me $0.52M becha (price -9 pts)
