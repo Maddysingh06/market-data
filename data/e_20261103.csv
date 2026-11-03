@@ -355,3 +355,8 @@ ts,venue,kind,side,a,b,note
 1793709592,binance,SLICE,BEAR,1.6,67.68571427890232,8 trade x 0.2000 BTC har ~67.7s (bikri)
 1793709683,hyperliquid,BURST,BEAR,541881.0591,-27.881416789998184,wallet 0xa7f1..7c8e ne 1 min me $0.54M becha (price -28 pts)
 1793709972,hyperliquid,BURST,BEAR,524283.21628,20.70000000001164,wallet 0xcf3f..f95f ne 1 min me $0.52M becha (price +21 pts)
+1793710020,hyperliquid,BURST,BEAR,500670.03322,2.9644782599934842,wallet 0xfeb6..5fa0 ne 1 min me $0.50M becha (price +3 pts)
+1793710167,hyperliquid,BURST,BEAR,506224.99773,1.0984282800054643,wallet 0xadbe..f873 ne 1 min me $0.51M becha (price +1 pts)
+1793710356,hyperliquid,BURST,BULL,528095.97384,-3.9959637699939776,wallet 0x36c0..2e0b ne 1 min me $0.53M kharida (price -4 pts)
+1793710404,binance,SLICE,BULL,1.032,54.698714290346416,8 trade x 0.1290 BTC har ~54.7s (kharid)
+1793710544,hyperliquid,BURST,BEAR,532109.94441,-31.635985510001774,wallet 0x5c29..a00b ne 1 min me $0.53M becha (price -32 pts)
