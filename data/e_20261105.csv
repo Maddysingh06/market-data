@@ -153,3 +153,5 @@ ts,venue,kind,side,a,b,note
 1793865300,binance,ABSORB,BULL,103.97000000000008,-8.200000000011642,bhaari bikri 104 BTC par price nahi gira (neeche koi le raha) (price -8 pts is 1 min me)
 1793865363,binance,SLICE,BULL,1.8539999999999999,45.00050002336502,9 trade x 0.2060 BTC har ~45.0s (kharid)
 1793865380,hyperliquid,BURST,BEAR,518658.09204,6.0,wallet 0xd65f..d0c7 ne 1 min me $0.52M becha (price +6 pts)
+1793865960,binance,ABSORB,BEAR,157.92400000000038,-15.599999999991269,bhaari kharid 158 BTC par price nahi chadha (upar koi bech raha) (price -16 pts is 1 min me)
+1793866039,hyperliquid,BURST,BULL,546611.71179,0.0,wallet 0xe668..b5ca ne 1 min me $0.55M kharida (price +0 pts)
